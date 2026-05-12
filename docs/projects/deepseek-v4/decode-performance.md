@@ -5,7 +5,7 @@
 
 ## TL;DR
 
-This document consolidates the DeepSeek V4 decode work that moved fixed long decode from the `~108-113ms/token` band to the current shared-expert fused branch at about `29.86-29.97ms/token` on the latest clean fixed bench, with earlier shared-expert fused repeats at `28.16-32.22ms/token`, routed W13+SwiGLU-quant validation at `31.18-33.42ms/token`, W13-only validation at `31.99-34.22ms/token`, and shared-quant-only validation at `33.33-34.29ms/token`. The retained changes are grouped MoE pointer caching, rank-worker placement, removal of hot temporary zero-fill, rank-owned decode scratch, caller-owned grouped FP4 workspace, shared W1/W3 activation quantization, W13 grouped FP4 runtime launch, routed fused SwiGLU+W2 activation quantization, shared expert fused W1/W3 quant, shared fused SwiGLU+W2 quant, shared dense FP8 W13, fused MoE mapping clear, and benchmark/counter instrumentation. The active MoE goal is stable sub-`30ms/token` decode first, then sub-`25ms/token`, by mirroring mature vLLM/SGLang decode MoE decomposition and only then exploring deeper fusion without bs=1 specialization. Exact E2E remains `20/20`, and the fixed bench token hash remains `6346f03343d75a65`.
+This document consolidates the DeepSeek V4 decode work that moved fixed long decode from the `~108-113ms/token` band to the current small-route mapping branch at about `27.61-27.83ms/token`, with prior clean sub-30 validation at `29.86-29.97ms/token`, earlier shared-expert fused repeats at `28.16-32.22ms/token`, routed W13+SwiGLU-quant validation at `31.18-33.42ms/token`, W13-only validation at `31.99-34.22ms/token`, and shared-quant-only validation at `33.33-34.29ms/token`. The retained changes are grouped MoE pointer caching, rank-worker placement, removal of hot temporary zero-fill, rank-owned decode scratch, caller-owned grouped FP4 workspace, shared W1/W3 activation quantization, W13 grouped FP4 runtime launch, routed fused SwiGLU+W2 activation quantization, shared expert fused W1/W3 quant, shared fused SwiGLU+W2 quant, shared dense FP8 W13, fused MoE mapping clear, small-route MoE mapping, and benchmark/counter instrumentation. The active MoE goal is stable sub-`30ms/token` decode first, then sub-`25ms/token`, by mirroring mature vLLM/SGLang decode MoE decomposition and only then exploring deeper fusion without bs=1 specialization. Exact E2E remains `20/20`, and the fixed bench token hash remains `6346f03343d75a65`.
 
 The retained team lessons are more important than the discarded attempt logs: compare identical token traces, separate NCCL wait from transfer, treat capacity and logical length separately, keep MoE semantic zero on device, and prove allocation cleanup with application-visible CUDA API counters rather than nsys attribution alone.
 
@@ -39,6 +39,7 @@ target/release/bench_serving \
 | Shared expert fused quant + dense W13 | `29.764ms`, repeated `31.592ms` | Shared expert scratch path reuses one FP8 act quant for W1/W3, fuses shared SwiGLU+W2 act quant, and uses one dense FP8 W13 launch; token hash stays `6346f03343d75a65`, exact E2E `20/20`. |
 | Clean sub-30 repeat after trace cleanup | `29.944ms`, `29.907ms`, `29.896ms` | Same fixed bench after removing per-layer trace syncs; all three measured iterations keep token hash `6346f03343d75a65`. |
 | Fused MoE mapping clear | `29.862ms`, `29.969ms`, `29.874ms` | Merge six local-route mapping clear launches into one kernel; exact E2E `20/20`, token hash stays `6346f03343d75a65`. |
+| Small-route MoE mapping | first run `27.608ms`, `27.662ms`, `27.826ms`; repeat `27.698ms`, `27.693ms`, `27.644ms` | Decode route mapping uses one small-batch kernel for `route_elems <= 1024`; exact E2E `20/20`, token hash stays `6346f03343d75a65`. |
 
 Final PR validation on 5090:
 
@@ -426,6 +427,32 @@ These clears are semantic initialization, not removable allocation noise, but th
 
 Keep decision: retain. The fixed bench movement is small, but the structural change removes five launches from every MoE mapping without changing math or adding synchronization.
 
+### Retained: small-route MoE mapping
+
+After fusing clears, decode still paid four mapping launches per layer/rank/token:
+
+```text
+clear mapping buffers
+count local expert rows
+prefix local expert row counts
+fill compact maps
+```
+
+For MP8 decode, `route_elems = global_batch * topk`; with the fixed single-request bench this is `8 * 6 = 48`. The retained fast path uses one block when `route_elems <= 1024 && local_experts <= 256`, doing clear, count, prefix, and map fill with block-level barriers. Larger routed batches and prefill still use the existing multi-kernel path, so this is a small-problem route-mapping path rather than a bs=1-only branch.
+
+5090 validation:
+
+| Check | Result |
+| --- | --- |
+| local `cargo fmt --check` | passed |
+| local `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4` | passed |
+| release `deepseek_v4_e2e` | `All 20 DeepSeek V4 exact cases passed` |
+| fixed bench JSON run 1 | `27.608ms`, `27.662ms`, `27.826ms`, all hash `6346f03343d75a65` |
+| fixed bench JSON run 2 | `27.698ms`, `27.693ms`, `27.644ms`, all hash `6346f03343d75a65` |
+| short nsys kernel summary | `deepseek_moe_local_mapping_small_kernel` replaces split clear/count/prefix/mapping kernels for the small decode route shape |
+
+Keep decision: retain. This is a real structural win: the same route semantics move from four launches to one launch in decode-sized routed batches, and repeated fixed benches stay in the `27.6-27.8ms/token` band.
+
 Evidence required for each adoption step:
 
 - vLLM/SGLang source location and whether we copied the decomposition, the kernel shape, or only the validation idea.
@@ -549,6 +576,9 @@ Local:
 - fused-clear exact E2E log `/tmp/dsv4_clear_fused_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
 - fused-clear fixed bench log `/tmp/dsv4_clear_fused_bench.log`: per-iteration steady TPOT avg `29.862ms`, `29.969ms`, `29.874ms`, all hash `6346f03343d75a65`
 - fused-clear short nsys log `/tmp/dsv4_clear_fused_short_profile.txt`: `deepseek_moe_clear_mapping_kernel` replaces the old repeated clear kernel
+- small-route exact E2E log `/tmp/dsv4_small_mapping_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
+- small-route fixed bench logs `/tmp/dsv4_small_mapping_bench.log` and `/tmp/dsv4_small_mapping_bench_repeat.log`: per-iteration steady TPOT avg `27.608ms`, `27.662ms`, `27.826ms`, then `27.698ms`, `27.693ms`, `27.644ms`; all hash `6346f03343d75a65`
+- small-route short nsys log `/tmp/dsv4_small_mapping_short_profile.txt`: `deepseek_moe_local_mapping_small_kernel` is the decode-sized route mapping path
 - `gcc -shared -fPIC -O2 -Wall -Wextra -o /tmp/cuda_api_counter.so tools/cuda_api_counter.c -ldl`
 - `nm -D /tmp/cuda_api_counter.so` confirmed base and `_ptsz` wrappers
 
