@@ -9,10 +9,30 @@ members = [
     "pegainfer-deepseek-v4",
     "pegainfer-qwen3-4b",
     "pegainfer-qwen35-4b",
+    # ---- pegainfer-comm (EP all-to-all skeleton, hardware-free default) ----
+    "pegainfer-comm",
+    "pegainfer-comm/crates/pegainfer-comm-build-utils",
+    "pegainfer-comm/crates/pegainfer-comm-cuda-sys",
+    "pegainfer-comm/crates/pegainfer-comm-cudart-sys",
+    "pegainfer-comm/crates/pegainfer-comm-gdrapi-sys",
+    "pegainfer-comm/crates/pegainfer-comm-libibverbs-sys",
+    "pegainfer-comm/crates/pegainfer-comm-cuda-lib",
+    "pegainfer-comm/crates/pegainfer-comm-thread-lib",
+    "pegainfer-comm/crates/pegainfer-comm-proc-lib",
+    "pegainfer-comm/crates/pegainfer-comm-logging-lib",
+    "pegainfer-comm/crates/pegainfer-comm-torch-lib",
+    "pegainfer-comm/crates/pegainfer-comm-fabric-lib",
+    "pegainfer-comm/crates/pegainfer-comm-fabric-debug",
+    "pegainfer-comm/crates/pegainfer-comm-a2a-kernels",
+    "pegainfer-comm/crates/pegainfer-comm-p2p-all-to-all",
+    "pegainfer-comm/crates/pegainfer-comm-python-ext",
 ]
 
 [workspace.dependencies]
 anyhow = "1.0"
+bincode = "2.0.1"
+bindgen = "0.72.1"
+bytes = { version = "1.10.1", features = ["serde"] }
 cc = "1.2"
 clap = { version = "4.6.1", features = ["derive"] }
 colored = "3"
@@ -26,13 +46,21 @@ cudarc = { version = "0.19.4", features = [
     "f16",
     "nccl",
 ] }
+cxx = "1.0.187"
+cxx-build = "1.0.187"
+dashmap = { version = "6.1.0", features = ["inline"] }
 fastrace = { version = "0.7.17", features = ["enable"] }
 half = { version = "2.7", features = ["num-traits"] }
 hex = "0.4"
+is-terminal = "0.4"
 log = "0.4"
 logforth = { version = "0.29", features = ["starter-log", "layout-text", "diagnostic-task-local"] }
 libc = "0.2"
 memmap2 = "0.9"
+mockall = "0.13.1"
+nvtx = "1.3.0"
+once_cell = "1.21.3"
+oneshot = "0.1.11"
 parking_lot = "0.12.5"
 pegainfer-core = { path = "pegainfer-core" }
 pegainfer-cupti = { path = "pegainfer-cupti" }
@@ -40,7 +68,18 @@ pegainfer-deepseek-v4 = { path = "pegainfer-deepseek-v4" }
 pegainfer-kernels = { path = "pegainfer-kernels" }
 pegainfer-qwen3-4b = { path = "pegainfer-qwen3-4b" }
 pegainfer-qwen35-4b = { path = "pegainfer-qwen35-4b" }
+pegainfer-comm = { path = "pegainfer-comm" }
+pkg-config = "0.3.32"
+postcard = { version = "1.1.3", features = ["alloc", "use-std"] }
+pyo3 = { version = "0.27.1", features = ["anyhow"] }
 rand = "0.10"
+smallvec = { version = "1.15.1", features = ["serde", "union"] }
+syscalls = "0.7.0"
+thiserror = "2.0.17"
+tracing = "0.1.41"
+tracing-core = "0.1.34"
+tracing-log = "0.2.0"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "json"] }
 rmp-serde = "1.3"
 rmpv = "1.3"
 safetensors = "0.7"
