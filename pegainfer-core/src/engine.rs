@@ -43,6 +43,8 @@ pub enum FinishReason {
 }
 
 pub struct GenerateRequest {
+    pub request_id: Option<String>,
+    pub queued_at_unix_s: Option<f64>,
     pub prompt_tokens: Vec<u32>,
     pub params: SamplingParams,
     pub max_tokens: usize,
@@ -52,6 +54,11 @@ pub struct GenerateRequest {
 }
 
 pub enum TokenEvent {
+    Scheduled {
+        queued_at_unix_s: f64,
+        scheduled_at_unix_s: f64,
+        prompt_tokens: usize,
+    },
     Token {
         id: u32,
         logprob: Option<TokenLogprob>,

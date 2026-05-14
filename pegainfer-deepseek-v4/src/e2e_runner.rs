@@ -204,6 +204,8 @@ fn generate_text(
 
     handle
         .submit(GenerateRequest {
+            request_id: None,
+            queued_at_unix_s: None,
             prompt_tokens,
             params: SamplingParams::default(),
             max_tokens,
@@ -250,6 +252,7 @@ fn collect_generation_events(
                 }
             }
             Some(TokenEvent::PromptTokens { .. }) => {}
+            Some(TokenEvent::Scheduled { .. }) => {}
             Some(TokenEvent::Finished { .. }) => break,
             Some(TokenEvent::Error { message, .. }) => bail!("generation failed: {message}"),
             Some(TokenEvent::Rejected { message, .. }) => bail!("generation rejected: {message}"),

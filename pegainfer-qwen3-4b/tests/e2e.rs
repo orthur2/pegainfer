@@ -75,6 +75,8 @@ fn generate_tokens(
 
     handle
         .submit(GenerateRequest {
+            request_id: None,
+            queued_at_unix_s: None,
             prompt_tokens,
             params: SamplingParams::default(), // greedy
             max_tokens,
@@ -90,6 +92,7 @@ fn generate_tokens(
         match token_rx.blocking_recv() {
             Some(TokenEvent::Token { id, .. }) => tokens.push(id),
             Some(TokenEvent::PromptTokens { .. }) => {}
+            Some(TokenEvent::Scheduled { .. }) => {}
             Some(TokenEvent::Finished { finish_reason, .. }) => {
                 return (tokens, finish_reason);
             }
@@ -194,6 +197,8 @@ fn test_e2e_generation() {
         // Submit should succeed — scheduler will notice send error and retire the request
         handle
             .submit(GenerateRequest {
+                request_id: None,
+                queued_at_unix_s: None,
                 prompt_tokens,
                 params: SamplingParams::default(),
                 max_tokens: 10,
