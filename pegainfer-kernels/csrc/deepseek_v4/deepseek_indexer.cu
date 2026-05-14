@@ -10,8 +10,15 @@ struct DeepseekFp4QuantScratch {
   size_t scale_bytes = 0;
 };
 
+struct DeepseekIndexerScoresScratch {
+  __nv_bfloat16 *dots = nullptr;
+  size_t dot_elems = 0;
+};
+
 static DeepseekFp4QuantScratch g_fp4_quant_scratch[16];
 static std::mutex g_fp4_quant_scratch_mutex[16];
+static DeepseekIndexerScoresScratch g_indexer_scores_scratch[16];
+static std::mutex g_indexer_scores_scratch_mutex[16];
 
 static cudaError_t deepseek_ensure_bf16_scratch(
     __nv_bfloat16 **ptr,
@@ -52,6 +59,14 @@ extern "C" int deepseek_tilelang_fp4_quant_inplace_n128(
     void* y,
     void* scales,
     int m,
+    cudaStream_t stream);
+
+extern "C" cudaError_t deepseek_cutedsl_indexer_dots_bf16_cuda(
+    const __nv_bfloat16 *q,
+    const __nv_bfloat16 *kv,
+    __nv_bfloat16 *dots,
+    int rows,
+    int compressed_len,
     cudaStream_t stream);
 
 __global__ void deepseek_indexer_scores_prefill_kernel(
@@ -133,6 +148,50 @@ __global__ void deepseek_indexer_scores_prefill_serial_kernel(
   }
 
   scores[token * compressed_len + compressed] = acc * score_scale;
+}
+
+__global__ void deepseek_indexer_scores_epilogue_kernel(
+    const __nv_bfloat16 *__restrict__ dots,
+    const __nv_bfloat16 *__restrict__ weights,
+    float *__restrict__ scores,
+    int seq_len,
+    int local_heads,
+    int compressed_len,
+    float score_scale) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = seq_len * compressed_len;
+  if (idx >= total) return;
+
+  int token = idx / compressed_len;
+  int compressed = idx - token * compressed_len;
+  float acc = 0.0f;
+  for (int head = 0; head < local_heads; ++head) {
+    int dot_idx = (token * local_heads + head) * compressed_len + compressed;
+    float dot = __bfloat162float(dots[dot_idx]);
+    float weight = __bfloat162float(weights[token * local_heads + head]);
+    acc += fmaxf(dot, 0.0f) * weight;
+  }
+  scores[token * compressed_len + compressed] = acc * score_scale;
+}
+
+__global__ void deepseek_indexer_scores_decode_epilogue_kernel(
+    const __nv_bfloat16 *__restrict__ dots,
+    const __nv_bfloat16 *__restrict__ weights,
+    float *__restrict__ scores,
+    int local_heads,
+    int compressed_len,
+    float score_scale) {
+  int compressed = blockIdx.x * blockDim.x + threadIdx.x;
+  if (compressed >= compressed_len) return;
+
+  float acc = 0.0f;
+  for (int head = 0; head < local_heads; ++head) {
+    int dot_idx = head * compressed_len + compressed;
+    float dot = __bfloat162float(dots[dot_idx]);
+    float weight = __bfloat162float(weights[head]);
+    acc += fmaxf(dot, 0.0f) * weight;
+  }
+  scores[compressed] = acc * score_scale;
 }
 
 __global__ void deepseek_indexer_topk_prefill_kernel(
@@ -551,11 +610,31 @@ cudaError_t deepseek_indexer_scores_prefill_cuda(
     int compressed_len,
     float score_scale,
     cudaStream_t stream) {
+  if (q == nullptr || kv == nullptr || weights == nullptr || scores == nullptr ||
+      seq_len <= 0 || local_heads <= 0 || head_dim != 128 || compressed_len <= 0) {
+    return cudaErrorInvalidValue;
+  }
+
+  int device = 0;
+  cudaError_t err = cudaGetDevice(&device);
+  if (err != cudaSuccess) return err;
+  if (device < 0 || device >= 16) return cudaErrorInvalidDevice;
+
+  std::lock_guard<std::mutex> lock(g_indexer_scores_scratch_mutex[device]);
+  DeepseekIndexerScoresScratch &scratch = g_indexer_scores_scratch[device];
+  size_t dot_elems = static_cast<size_t>(seq_len) * local_heads * compressed_len;
+  err = deepseek_ensure_bf16_scratch(&scratch.dots, &scratch.dot_elems, dot_elems);
+  if (err != cudaSuccess) return err;
+
+  err = deepseek_cutedsl_indexer_dots_bf16_cuda(
+      q, kv, scratch.dots, seq_len * local_heads, compressed_len, stream);
+  if (err != cudaSuccess) return err;
+
   constexpr int threads = 256;
   int total = seq_len * compressed_len;
   int blocks = (total + threads - 1) / threads;
-  deepseek_indexer_scores_prefill_serial_kernel<<<blocks, threads, 0, stream>>>(
-      q, kv, weights, scores, seq_len, local_heads, head_dim, compressed_len, score_scale);
+  deepseek_indexer_scores_epilogue_kernel<<<blocks, threads, 0, stream>>>(
+      scratch.dots, weights, scores, seq_len, local_heads, compressed_len, score_scale);
   return cudaGetLastError();
 }
 
@@ -585,13 +664,30 @@ cudaError_t deepseek_indexer_scores_decode_cuda(
     int compressed_len,
     float score_scale,
     cudaStream_t stream) {
-  if (local_heads <= 0 || head_dim <= 0 || compressed_len <= 0) {
+  if (q == nullptr || kv == nullptr || weights == nullptr || scores == nullptr ||
+      local_heads <= 0 || head_dim != 128 || compressed_len <= 0) {
     return cudaErrorInvalidValue;
   }
+
+  int device = 0;
+  cudaError_t err = cudaGetDevice(&device);
+  if (err != cudaSuccess) return err;
+  if (device < 0 || device >= 16) return cudaErrorInvalidDevice;
+
+  std::lock_guard<std::mutex> lock(g_indexer_scores_scratch_mutex[device]);
+  DeepseekIndexerScoresScratch &scratch = g_indexer_scores_scratch[device];
+  size_t dot_elems = static_cast<size_t>(local_heads) * compressed_len;
+  err = deepseek_ensure_bf16_scratch(&scratch.dots, &scratch.dot_elems, dot_elems);
+  if (err != cudaSuccess) return err;
+
+  err = deepseek_cutedsl_indexer_dots_bf16_cuda(
+      q, kv, scratch.dots, local_heads, compressed_len, stream);
+  if (err != cudaSuccess) return err;
+
   constexpr int threads = 256;
   int blocks = (compressed_len + threads - 1) / threads;
-  deepseek_indexer_scores_decode_serial_kernel<<<blocks, threads, 0, stream>>>(
-      q, kv, weights, scores, local_heads, head_dim, compressed_len, score_scale);
+  deepseek_indexer_scores_decode_epilogue_kernel<<<blocks, threads, 0, stream>>>(
+      scratch.dots, weights, scores, local_heads, compressed_len, score_scale);
   return cudaGetLastError();
 }
 

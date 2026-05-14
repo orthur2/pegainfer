@@ -29,6 +29,13 @@ struct TileLangArtifacts {
     cutlass_include: PathBuf,
 }
 
+struct CuTeDslArtifacts {
+    obj_files: Vec<PathBuf>,
+    wrapper_files: Vec<PathBuf>,
+    include_dir: PathBuf,
+    runtime_lib_dirs: Vec<PathBuf>,
+}
+
 struct FlashInferIncludes {
     include: PathBuf,
     csrc: PathBuf,
@@ -111,7 +118,7 @@ fn parse_sm_token(raw: &str) -> Option<String> {
         .unwrap_or(token);
 
     if let Some((major, minor)) = token.split_once('.') {
-        let digit_count = minor.chars().take_while(|c| c.is_ascii_digit()).count();
+        let digit_count = minor.chars().take_while(char::is_ascii_digit).count();
         let (minor_digits, suffix) = minor.split_at(digit_count);
         if major.chars().all(|c| c.is_ascii_digit())
             && !minor_digits.is_empty()
@@ -122,7 +129,7 @@ fn parse_sm_token(raw: &str) -> Option<String> {
         return None;
     }
 
-    let digit_count = token.chars().take_while(|c| c.is_ascii_digit()).count();
+    let digit_count = token.chars().take_while(char::is_ascii_digit).count();
     let (digits, suffix) = token.split_at(digit_count);
     if !digits.is_empty() && suffix.chars().all(|c| c.is_ascii_alphabetic()) {
         if digits.len() == 1 {
@@ -215,7 +222,7 @@ fn nvcc_arch_args(sm_targets: &[String]) -> Vec<String> {
         .map(|sm| normalize_flashinfer_sm(sm))
         .max_by_key(|sm| {
             sm.chars()
-                .take_while(|c| c.is_ascii_digit())
+                .take_while(char::is_ascii_digit)
                 .collect::<String>()
                 .parse::<u32>()
                 .unwrap_or(0)
@@ -235,7 +242,7 @@ fn collect_files_recursively(dir: &Path, out: &mut Vec<PathBuf>) {
             entry.unwrap_or_else(|err| panic!("Failed to read entry in {}: {err}", dir.display()))
         })
         .collect();
-    entries.sort_by_key(|entry| entry.path());
+    entries.sort_by_key(std::fs::DirEntry::path);
 
     for entry in entries {
         let path = entry.path();
@@ -377,6 +384,58 @@ fn find_tilelang_python() -> Result<String, String> {
     ))
 }
 
+fn probe_cutedsl_python(candidate: &str) -> Result<String, String> {
+    let output = Command::new(candidate)
+        .args(["-c", "import cutlass, cutlass.cute"])
+        .output()
+        .map_err(|err| format!("{candidate}: {err}"))?;
+
+    if output.status.success() {
+        Ok(candidate.to_string())
+    } else {
+        Err(format!(
+            "{candidate}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+fn find_cutedsl_python() -> Result<String, String> {
+    if let Ok(candidate) = std::env::var("PEGAINFER_CUTEDSL_PYTHON") {
+        let candidate = candidate.trim();
+        if candidate.is_empty() {
+            return Err("PEGAINFER_CUTEDSL_PYTHON is set but empty.".to_string());
+        }
+        return probe_cutedsl_python(candidate).map_err(|message| {
+            format!("PEGAINFER_CUTEDSL_PYTHON=`{candidate}` could not import CuTe DSL: {message}")
+        });
+    }
+
+    let workspace_venv = workspace_root().join(".venv/bin/python");
+    let parent_venv = workspace_root().join("../.venv/bin/python");
+    let mut diagnostics = Vec::new();
+    let mut candidates = Vec::new();
+    if workspace_venv.exists() {
+        candidates.push(workspace_venv.to_string_lossy().to_string());
+    }
+    if parent_venv.exists() {
+        candidates.push(parent_venv.to_string_lossy().to_string());
+    }
+    candidates.extend(["python3".to_string(), "python".to_string()]);
+
+    for candidate in candidates {
+        match probe_cutedsl_python(&candidate) {
+            Ok(path) => return Ok(path),
+            Err(message) => diagnostics.push(message),
+        }
+    }
+
+    Err(format!(
+        "Could not find a Python interpreter with CuTe DSL installed. Set PEGAINFER_CUTEDSL_PYTHON. Probe results: {}.",
+        diagnostics.join(" | ")
+    ))
+}
+
 fn generate_deepseek_tilelang_artifacts(out_dir: &Path) -> TileLangArtifacts {
     let python = find_tilelang_python().unwrap_or_else(|message| {
         panic!("DeepSeek V4 TileLang kernels require TileLang at build time: {message}")
@@ -437,6 +496,90 @@ fn generate_deepseek_tilelang_artifacts(out_dir: &Path) -> TileLangArtifacts {
         cu_files: vec![cu_path],
         template_include,
         cutlass_include,
+    }
+}
+
+fn generate_deepseek_cutedsl_artifacts(out_dir: &Path) -> CuTeDslArtifacts {
+    let python = find_cutedsl_python().unwrap_or_else(|message| {
+        panic!("DeepSeek V4 CuTe DSL kernels require CuTe DSL at build time: {message}")
+    });
+
+    let root = crate_root();
+    let repo_root = workspace_root();
+    let generator_path = root.join("tools/cutedsl/deepseek_v4/generate.py");
+    assert!(
+        generator_path.exists(),
+        "DeepSeek V4 CuTe DSL generator is missing: {}",
+        generator_path.display()
+    );
+
+    let artifact_dir = out_dir.join("cutedsl").join("deepseek_v4");
+    let mut command = Command::new(&python);
+    command
+        .arg(&generator_path)
+        .arg("--out-dir")
+        .arg(&artifact_dir)
+        .arg("--repo-root")
+        .arg(&repo_root);
+    if let Ok(cutlass_root) = std::env::var("PEGAINFER_CUTEDSL_CUTLASS_ROOT") {
+        command.arg("--cutlass-root").arg(cutlass_root);
+    }
+
+    let output = time_phase("cutedsl-gen deepseek_v4", || {
+        command
+            .output()
+            .unwrap_or_else(|err| panic!("failed to run DeepSeek CuTe DSL generator: {err}"))
+    });
+    assert!(
+        output.status.success(),
+        "DeepSeek CuTe DSL generator failed. stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout).trim(),
+        String::from_utf8_lossy(&output.stderr).trim(),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut obj_files = Vec::new();
+    let mut wrapper_files = Vec::new();
+    let mut include_dir = None;
+    let mut runtime_lib_dirs = Vec::new();
+    for line in stdout.lines() {
+        if let Some(value) = line.strip_prefix("OBJ_PATH=") {
+            obj_files.push(PathBuf::from(value.trim()));
+        } else if let Some(value) = line.strip_prefix("WRAPPER_PATH=") {
+            wrapper_files.push(PathBuf::from(value.trim()));
+        } else if let Some(value) = line.strip_prefix("HEADER_DIR=") {
+            include_dir = Some(PathBuf::from(value.trim()));
+        } else if let Some(value) = line.strip_prefix("RUNTIME_LIB_DIR=") {
+            runtime_lib_dirs.push(PathBuf::from(value.trim()));
+        }
+    }
+
+    let include_dir = include_dir.expect("DeepSeek CuTe DSL generator did not print HEADER_DIR");
+    assert!(
+        !obj_files.is_empty() && !wrapper_files.is_empty(),
+        "DeepSeek CuTe DSL generator did not emit OBJ_PATH/WRAPPER_PATH"
+    );
+    for path in obj_files.iter().chain(wrapper_files.iter()) {
+        assert!(
+            path.exists(),
+            "generated CuTe DSL artifact missing: {}",
+            path.display()
+        );
+    }
+
+    println!(
+        "cargo:warning=Using DeepSeek V4 CuTe DSL AOT artifacts from {}",
+        artifact_dir.display()
+    );
+    println!("cargo:rerun-if-changed={}", generator_path.display());
+    println!("cargo:rerun-if-env-changed=PEGAINFER_CUTEDSL_PYTHON");
+    println!("cargo:rerun-if-env-changed=PEGAINFER_CUTEDSL_CUTLASS_ROOT");
+
+    CuTeDslArtifacts {
+        obj_files,
+        wrapper_files,
+        include_dir,
+        runtime_lib_dirs,
     }
 }
 
@@ -864,6 +1007,11 @@ fn main() {
     } else {
         None
     };
+    let cutedsl_artifacts = if deepseek_enabled {
+        Some(generate_deepseek_cutedsl_artifacts(&out_dir))
+    } else {
+        None
+    };
     println!(
         "cargo:warning=Compiling CUDA kernels for targets: {}",
         sm_targets
@@ -1025,6 +1173,39 @@ fn main() {
         }
     }
 
+    let mut cutedsl_obj_files = Vec::new();
+    let mut cutedsl_runtime_lib_dirs = Vec::new();
+    if let Some(cutedsl_artifacts) = cutedsl_artifacts {
+        cutedsl_obj_files.extend(cutedsl_artifacts.obj_files);
+        cutedsl_runtime_lib_dirs.extend(cutedsl_artifacts.runtime_lib_dirs);
+        for cu_file in cutedsl_artifacts.wrapper_files {
+            let stem = cu_file.file_stem().unwrap().to_str().unwrap();
+            let obj_file = out_dir.join(format!("{stem}_cuda.o"));
+            let mut nvcc_args = vec![
+                "-c".to_string(),
+                cu_file.to_string_lossy().to_string(),
+                "-o".to_string(),
+                obj_file.to_string_lossy().to_string(),
+                "-O3".to_string(),
+                "-I".to_string(),
+                cuda_include.to_string_lossy().to_string(),
+            ];
+            nvcc_args.extend(arch_args.clone());
+            nvcc_args.extend([
+                "--std=c++17".to_string(),
+                "--compiler-options".to_string(),
+                "-fPIC".to_string(),
+                "-I".to_string(),
+                cutedsl_artifacts.include_dir.to_string_lossy().to_string(),
+            ]);
+            nvcc_tasks.push(NvccTask {
+                cu_file,
+                obj_file,
+                args: nvcc_args,
+            });
+        }
+    }
+
     nvcc_tasks.sort_by_key(|task| nvcc_task_priority(&task.cu_file));
 
     let task_queue = Mutex::new(VecDeque::from(nvcc_tasks));
@@ -1070,6 +1251,8 @@ fn main() {
         }
     });
     obj_files.sort();
+    obj_files.extend(cutedsl_obj_files);
+    obj_files.sort();
 
     let cuda_lib = out_dir.join("libkernels_cuda.a");
     let _ = fs::remove_file(&cuda_lib);
@@ -1097,9 +1280,15 @@ fn main() {
     } else {
         println!("cargo:rustc-link-search=native={}/lib64", cuda_path);
     }
+    for dir in &cutedsl_runtime_lib_dirs {
+        println!("cargo:rustc-link-search=native={}", dir.display());
+    }
     println!("cargo:rustc-link-lib=static=kernels_cuda");
     println!("cargo:rustc-link-lib=cudart");
     println!("cargo:rustc-link-lib=cublas");
+    if !cutedsl_runtime_lib_dirs.is_empty() {
+        println!("cargo:rustc-link-lib=static=cuda_dialect_runtime_static");
+    }
     if !cfg!(target_os = "windows") {
         println!("cargo:rustc-link-lib=stdc++");
     }

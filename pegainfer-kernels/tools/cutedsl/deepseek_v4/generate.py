@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""Generate DeepSeek V4 CuTe DSL AOT artifacts.
+
+The first production CuTe DSL target is the indexer score dot product:
+
+    dots[(token * local_heads + head), compressed] =
+        dot(q[token, head, :], kv[compressed, :])
+
+The original CUDA entry points keep their C ABI and run the small ReLU/weight
+epilogue in CUDA. This generator only exports the BF16 TensorCore GEMM used for
+the dot stage.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import shutil
+from pathlib import Path
+
+import cuda.bindings.driver as cuda
+import cutlass
+import cutlass.cute as cute
+from cutlass.cute.runtime import make_fake_compact_tensor
+
+
+def load_sm120_gemm_class(cutlass_root: Path):
+    gemm_path = (
+        cutlass_root
+        / "examples/python/CuTeDSL/cute/blackwell_geforce/kernel/dense_gemm/dense_gemm.py"
+    )
+    if not gemm_path.exists():
+        raise FileNotFoundError(f"SM120 CuTe DSL dense_gemm.py not found: {gemm_path}")
+    spec = importlib.util.spec_from_file_location("pegainfer_cutedsl_sm120_dense_gemm", gemm_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module.Sm120GemmKernel
+
+
+def find_cutlass_root(repo_root: Path, explicit: str | None) -> Path:
+    candidates = []
+    if explicit:
+        candidates.append(Path(explicit))
+    candidates.extend(
+        [
+            repo_root / "../cutlass-upstream",
+            repo_root / "cutlass-upstream",
+            repo_root / "pegainfer-kernels/third_party/flashinfer/3rdparty/cutlass",
+        ]
+    )
+    for candidate in candidates:
+        candidate = candidate.resolve()
+        if (
+            candidate
+            / "examples/python/CuTeDSL/cute/blackwell_geforce/kernel/dense_gemm/dense_gemm.py"
+        ).exists():
+            return candidate
+    raise FileNotFoundError(
+        "Could not find CUTLASS CuTe DSL examples. Set PEGAINFER_CUTEDSL_CUTLASS_ROOT."
+    )
+
+
+def write_wrapper(out_dir: Path) -> Path:
+    wrapper = out_dir / "deepseek_v4_cutedsl_wrappers.cu"
+    wrapper.write_text(
+        r'''
+#include "deepseek_indexer_dots_gemm.h"
+
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
+
+#include <mutex>
+
+namespace {
+
+idx_gemm_Kernel_Module_t g_indexer_dots_module;
+std::once_flag g_indexer_dots_once;
+
+void load_indexer_dots_module_once() {
+  idx_gemm_Kernel_Module_Load(&g_indexer_dots_module);
+}
+
+}  // namespace
+
+extern "C" cudaError_t deepseek_cutedsl_indexer_dots_bf16_cuda(
+    const __nv_bfloat16 *q,
+    const __nv_bfloat16 *kv,
+    __nv_bfloat16 *dots,
+    int rows,
+    int compressed_len,
+    cudaStream_t stream) {
+  if (q == nullptr || kv == nullptr || dots == nullptr || rows <= 0 || compressed_len <= 0) {
+    return cudaErrorInvalidValue;
+  }
+
+  std::call_once(g_indexer_dots_once, load_indexer_dots_module_once);
+
+  idx_gemm_Tensor_a_t a{};
+  a.data = const_cast<__nv_bfloat16 *>(q);
+  a.dynamic_shapes[0] = rows;
+  a.dynamic_strides[0] = 128;
+
+  idx_gemm_Tensor_b_t b{};
+  b.data = const_cast<__nv_bfloat16 *>(kv);
+  b.dynamic_shapes[0] = compressed_len;
+  b.dynamic_strides[0] = 128;
+
+  idx_gemm_Tensor_c_t c{};
+  c.data = dots;
+  c.dynamic_shapes[0] = rows;
+  c.dynamic_shapes[1] = compressed_len;
+  c.dynamic_strides[0] = compressed_len;
+  c.dynamic_strides[1] = 1;
+
+  int32_t ret = cute_dsl_idx_gemm_wrapper(&g_indexer_dots_module, &a, &b, &c, stream);
+  if (ret != 0) {
+    return cudaErrorUnknown;
+  }
+  return cudaGetLastError();
+}
+'''.lstrip()
+    )
+    return wrapper
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--out-dir", required=True)
+    parser.add_argument("--repo-root", required=True)
+    parser.add_argument("--cutlass-root")
+    args = parser.parse_args()
+
+    out_dir = Path(args.out_dir).resolve()
+    shutil.rmtree(out_dir, ignore_errors=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    repo_root = Path(args.repo_root).resolve()
+    cutlass_root = find_cutlass_root(repo_root, args.cutlass_root)
+    Sm120GemmKernel = load_sm120_gemm_class(cutlass_root)
+
+    rows = cute.SymInt(divisibility=8)
+    compressed_len = cute.SymInt(divisibility=8)
+    q = make_fake_compact_tensor(
+        cutlass.BFloat16,
+        (rows, 128, 1),
+        stride_order=(1, 0, 2),
+    )
+    kv = make_fake_compact_tensor(
+        cutlass.BFloat16,
+        (compressed_len, 128, 1),
+        stride_order=(1, 0, 2),
+    )
+    dots = make_fake_compact_tensor(
+        cutlass.BFloat16,
+        (rows, compressed_len, 1),
+        stride_order=(1, 0, 2),
+    )
+    stream = cuda.CUstream(0)
+
+    kernel = Sm120GemmKernel(cutlass.Float32, (128, 128, 64))
+    compiled = cute.compile(kernel, q, kv, dots, 1, stream)
+    compiled.export_to_c(
+        file_path=str(out_dir),
+        file_name="deepseek_indexer_dots_gemm",
+        function_prefix="idx_gemm",
+    )
+    wrapper = write_wrapper(out_dir)
+
+    runtime_libs = cute.runtime.find_runtime_libraries(enable_tvm_ffi=False)
+    runtime_dirs = sorted({str(Path(path).resolve().parent) for path in runtime_libs})
+    print(f"OBJ_PATH={out_dir / 'deepseek_indexer_dots_gemm.o'}")
+    print(f"HEADER_DIR={out_dir}")
+    print(f"WRAPPER_PATH={wrapper}")
+    for runtime_dir in runtime_dirs:
+        print(f"RUNTIME_LIB_DIR={runtime_dir}")
+    print(f"CUTLASS_ROOT={cutlass_root}")
+
+
+if __name__ == "__main__":
+    main()
