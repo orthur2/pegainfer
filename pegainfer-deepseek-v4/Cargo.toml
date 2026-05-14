@@ -13,6 +13,10 @@ deepseek-v4-cutedsl-diagnostic = [
     "deepseek-v4",
     "pegainfer-kernels/deepseek-v4-cutedsl-diagnostic",
 ]
+deepseek-v4-cutedsl-indexer-score = [
+    "deepseek-v4",
+    "pegainfer-kernels/deepseek-v4-cutedsl-indexer-score",
+]
 
 [dependencies]
 anyhow = { workspace = true }
