@@ -49,6 +49,10 @@ pub(crate) fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Res
     let rank_sliced_load_plans = (0..placements.len())
         .map(|rank| weight_manifest.rank_sliced_load_plan(rank))
         .collect::<Result<Vec<_>>>()?;
+    #[cfg(feature = "pplx-ep")]
+    let pplx_thread_placement = pegainfer_core::cpu_topology::RankThreadPlacementPlan::for_devices(
+        &options.device_ordinals,
+    )?;
     let runtime_config = KimiK2RunnerConfig {
         model_path: model_path.to_path_buf(),
         weight_manifest,
@@ -58,6 +62,8 @@ pub(crate) fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Res
         rank_sliced_load_plans,
         placements,
         thread_placement,
+        #[cfg(feature = "pplx-ep")]
+        pplx_thread_placement,
         enable_cuda_graph: options.enable_cuda_graph,
     };
 
@@ -170,6 +176,7 @@ impl KimiK2Scheduler {
                         self.runtime.gpu_weight_ready_rank_count(),
                         self.runtime.rank_count()
                     );
+                    eprintln!("kimi-k2: {message}");
                     for req in active.drain(..) {
                         let _ = req.token_tx.send(TokenEvent::Error {
                             message: message.clone(),
@@ -407,6 +414,51 @@ impl KimiK2Runtime {
                 .map_err(|_| anyhow::anyhow!("Kimi rank {rank} dropped TP comm init response"))?
                 .with_context(|| format!("Kimi rank {rank} TP comm init"))?;
         }
+
+        #[cfg(feature = "pplx-ep")]
+        {
+            let ep_shape = pegainfer_comm::bootstrap::EpModelShape {
+                n_routed_experts: crate::config::KIMI_K2_ROUTED_EXPERTS,
+                n_activated_experts: crate::config::KIMI_K2_TOPK,
+                hidden_dim: crate::config::KIMI_K2_HIDDEN,
+            };
+            let devices: Vec<usize> = config.placements.iter().map(|p| p.device_ordinal).collect();
+            let pplx_params = pegainfer_comm::bootstrap::PplxBootstrapParams {
+                expert_padding: crate::runner::moe_pplx::PPLX_EXPERT_PADDING,
+                ..pegainfer_comm::bootstrap::PplxBootstrapParams::default()
+            };
+            match pegainfer_comm::bootstrap::build_intra_node_backends(
+                ep_shape,
+                &devices,
+                &config.pplx_thread_placement,
+                pplx_params,
+            ) {
+                Ok((backends, resources)) => {
+                    std::mem::forget(resources);
+                    let pplx_receivers = workers
+                        .iter()
+                        .zip(backends)
+                        .map(|(worker, backend)| worker.enable_pplx_async(backend))
+                        .collect::<Result<Vec<_>>>()?;
+                    for (rank, receiver) in pplx_receivers.into_iter().enumerate() {
+                        receiver
+                            .recv()
+                            .map_err(|_| {
+                                anyhow::anyhow!("Kimi rank {rank} dropped PPLX enable response")
+                            })?
+                            .with_context(|| format!("Kimi rank {rank} PPLX EP backend enable"))?;
+                    }
+                    eprintln!(
+                        "kimi-k2: pplx EP backends installed on all {} ranks",
+                        workers.len()
+                    );
+                }
+                Err(err) => {
+                    eprintln!("kimi-k2: pplx EP bootstrap failed, falling back to NCCL: {err:#}");
+                }
+            }
+        }
+
         Ok(Self {
             config,
             workers,

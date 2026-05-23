@@ -624,4 +624,84 @@ CUresult kimi_scaled_add_f32_bf16_to_bf16_cuda(
   return err == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_LAUNCH_FAILED;
 }
 
+__global__ void kimi_pplx_build_marlin_routing_kernel(
+    const int32_t* __restrict__ recv_tokens_per_expert,
+    int32_t* __restrict__ sorted_token_ids,
+    int32_t* __restrict__ expert_ids,
+    int32_t* __restrict__ num_tokens_post_padded,
+    int num_local_experts,
+    int expert_padding,
+    int block_size,
+    int max_padded_tokens,
+    int max_m_blocks) {
+  __shared__ int offsets[65];
+
+  int tid = threadIdx.x;
+
+  int padded = 0;
+  int count = 0;
+  if (tid < num_local_experts) {
+    count = recv_tokens_per_expert[tid];
+    if (count < 0) count = 0;
+    padded = ((count + expert_padding - 1) / expert_padding) * expert_padding;
+  }
+  offsets[tid + 1] = padded;
+  if (tid == 0) offsets[0] = 0;
+  __syncthreads();
+
+  if (tid == 0) {
+    for (int i = 1; i <= num_local_experts; i++)
+      offsets[i] += offsets[i - 1];
+  }
+  __syncthreads();
+
+  int total = offsets[num_local_experts];
+  int sentinel = max_padded_tokens;
+
+  if (tid < num_local_experts) {
+    int cursor = offsets[tid];
+    for (int j = 0; j < padded; j++) {
+      int idx = cursor + j;
+      if (idx < max_padded_tokens)
+        sorted_token_ids[idx] = (j < count) ? idx : sentinel;
+    }
+    int block_start = cursor / block_size;
+    int block_end = (cursor + padded) / block_size;
+    for (int b = block_start; b < block_end && b < max_m_blocks; b++)
+      expert_ids[b] = tid;
+  }
+
+  __syncthreads();
+  if (tid == 0) {
+    for (int j = total; j < max_padded_tokens; j++)
+      sorted_token_ids[j] = sentinel;
+    num_tokens_post_padded[0] = total;
+  }
+}
+
+CUresult kimi_pplx_build_marlin_routing_on_stream(
+    const int32_t* recv_tokens_per_expert,
+    int32_t* sorted_token_ids,
+    int32_t* expert_ids,
+    int32_t* num_tokens_post_padded,
+    int num_local_experts,
+    int expert_padding,
+    int block_size,
+    int max_padded_tokens,
+    int max_m_blocks,
+    cudaStream_t stream) {
+  kimi_pplx_build_marlin_routing_kernel<<<1, 64, 0, stream>>>(
+      recv_tokens_per_expert,
+      sorted_token_ids,
+      expert_ids,
+      num_tokens_post_padded,
+      num_local_experts,
+      expert_padding,
+      block_size,
+      max_padded_tokens,
+      max_m_blocks);
+  cudaError_t err = cudaGetLastError();
+  return err == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_LAUNCH_FAILED;
+}
+
 }  // extern "C"

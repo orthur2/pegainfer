@@ -1463,6 +1463,47 @@ pub fn kimi_marlin_w13_swiglu(
     Ok(())
 }
 
+/// SwiGLU for PPLX path: grid launched at `max_rows` but actual work
+/// limited by `num_tokens_post_padded[0]` read on-device — no D2H needed.
+pub fn kimi_marlin_w13_swiglu_pplx(
+    ctx: &DeviceContext,
+    w13: &HiddenStates,
+    num_tokens_post_padded: &CudaSlice<i32>,
+    output: &mut HiddenStates,
+) -> Result<()> {
+    validate_hidden_states(
+        "pplx_marlin_w13_swiglu.input",
+        w13,
+        2 * KIMI_K2_EXPERT_INTERMEDIATE,
+        output.seq_len,
+    )?;
+    validate_hidden_states(
+        "pplx_marlin_w13_swiglu.output",
+        output,
+        KIMI_K2_EXPERT_INTERMEDIATE,
+        w13.seq_len,
+    )?;
+    ensure!(
+        num_tokens_post_padded.len() >= 1,
+        "num_tokens_post_padded must have at least 1 element"
+    );
+    let (w13_ptr, _w13_guard) = w13.data.device_ptr(&ctx.stream);
+    let (out_ptr, _out_guard) = output.data.device_ptr_mut(&ctx.stream);
+    let (ntp_ptr, _ntp_guard) = num_tokens_post_padded.device_ptr(&ctx.stream);
+    let result = unsafe {
+        ffi::kimi_marlin_w13_swiglu_pplx_cuda(
+            w13_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            ntp_ptr as *const i32,
+            w13.seq_len as i32,
+            KIMI_K2_EXPERT_INTERMEDIATE as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result.result()?;
+    Ok(())
+}
+
 pub fn kimi_marlin_sum_topk_rows_f32(
     ctx: &DeviceContext,
     route_output: &HiddenStates,
@@ -1495,6 +1536,197 @@ pub fn kimi_marlin_sum_topk_rows_f32(
     };
     result.result()?;
     Ok(())
+}
+
+/// Build Marlin routing metadata on-stream from PPLX recv counts.
+///
+/// Launches a <<<1,1>>> CUDA kernel that reads `recv_tokens_per_expert`,
+/// computes padded expert layout, and fills `sorted_token_ids`, `expert_ids`,
+/// and `num_tokens_post_padded` directly on the GPU — zero D2H.
+///
+/// `seq_len` is the actual batch size for this decode step.  A tight upper
+/// bound on the total padded tokens is computed on the host:
+///
+///     tight = min(seq_len × topk, local_experts) × expert_padding
+///
+/// This replaces `pplx_recv_capacity` as `route_elems` / `max_padded_tokens`,
+/// shrinking Marlin lock clearing, SwiGLU grid, and routing-kernel fill from
+/// 3072 → 512 at bs=1.  The CUDA kernel writes the *actual* total to
+/// `num_tokens_post_padded[0]`; Marlin and `swiglu_w13_pplx` read it
+/// on-device to skip the remaining padding within `tight`.
+pub fn kimi_pplx_build_marlin_routing_on_stream<'a>(
+    ctx: &DeviceContext,
+    workspace: &'a mut KimiMarlinRouteWorkspace,
+    recv_tokens_per_expert: &CudaSlice<i32>,
+    expert_padding: usize,
+    pplx_recv_capacity: usize,
+    seq_len: usize,
+) -> Result<KimiMarlinRouting<'a>> {
+    ensure!(expert_padding > 0, "pplx expert_padding must be positive");
+    ensure!(
+        expert_padding % workspace.block_size == 0,
+        "pplx expert_padding {} must be a multiple of Marlin block_size {}",
+        expert_padding,
+        workspace.block_size
+    );
+    ensure!(
+        recv_tokens_per_expert.len() >= KIMI_K2_LOCAL_EXPERTS,
+        "recv_tokens_per_expert len must be >= {}, got {}",
+        KIMI_K2_LOCAL_EXPERTS,
+        recv_tokens_per_expert.len()
+    );
+    ensure!(
+        pplx_recv_capacity <= workspace.max_padded_tokens,
+        "pplx_recv_capacity {} exceeds workspace max_padded_tokens {}",
+        pplx_recv_capacity,
+        workspace.max_padded_tokens
+    );
+
+    let block_size = workspace.block_size;
+
+    // Host-side tight upper bound: at most min(seq_len*topk, local_experts)
+    // distinct experts receive tokens, each padded to expert_padding.
+    let max_nonzero_experts = (seq_len * KIMI_K2_TOPK).min(KIMI_K2_LOCAL_EXPERTS);
+    let tight_max = (max_nonzero_experts * expert_padding).min(pplx_recv_capacity);
+    let tight_m_blocks = tight_max.div_ceil(block_size);
+
+    {
+        let (counts_ptr, _g0) = recv_tokens_per_expert.device_ptr(&ctx.stream);
+        let (sorted_ptr, _g1) = workspace.sorted_token_ids.device_ptr_mut(&ctx.stream);
+        let (expert_ptr, _g2) = workspace.expert_ids.device_ptr_mut(&ctx.stream);
+        let (ntp_ptr, _g3) = workspace.num_tokens_post_padded.device_ptr_mut(&ctx.stream);
+
+        let result = unsafe {
+            ffi::kimi_pplx_build_marlin_routing_on_stream(
+                counts_ptr as *const i32,
+                sorted_ptr as *mut i32,
+                expert_ptr as *mut i32,
+                ntp_ptr as *mut i32,
+                KIMI_K2_LOCAL_EXPERTS as i32,
+                expert_padding as i32,
+                block_size as i32,
+                tight_max as i32,
+                tight_m_blocks as i32,
+                ctx.stream.cu_stream(),
+            )
+        };
+        if result != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            anyhow::bail!("kimi_pplx_build_marlin_routing_on_stream failed: {result:?}");
+        }
+    }
+
+    Ok(KimiMarlinRouting {
+        batch_size: tight_max,
+        active_tokens: tight_max,
+        route_elems: tight_max,
+        global_expert_start: 0,
+        block_size,
+        max_padded_tokens: tight_max,
+        max_m_blocks: tight_m_blocks,
+        sorted_token_ids: &workspace.sorted_token_ids,
+        expert_ids: &workspace.expert_ids,
+        num_tokens_post_padded: &workspace.num_tokens_post_padded,
+    })
+}
+
+/// W13 (gate+up) GEMM for PPLX path: top_k=1, no weight scaling.
+pub fn kimi_marlin_wna16_pplx_w13_gemm(
+    ctx: &DeviceContext,
+    workspace: &mut KimiMarlinWna16Workspace,
+    routing: &KimiMarlinRouting<'_>,
+    input: &HiddenStates,
+    weight: &KimiMarlinFusedW13Int4Weight<'_>,
+    topk_weight: &CudaSlice<f32>,
+    output_w13: &mut HiddenStates,
+) -> Result<()> {
+    weight.validate()?;
+    workspace.validate_for(routing, 2 * KIMI_K2_EXPERT_INTERMEDIATE)?;
+    validate_hidden_states(
+        "pplx_marlin_w13.input",
+        input,
+        KIMI_K2_HIDDEN,
+        routing.active_tokens,
+    )?;
+    validate_hidden_states(
+        "pplx_marlin_w13.output",
+        output_w13,
+        2 * KIMI_K2_EXPERT_INTERMEDIATE,
+        routing.route_elems,
+    )?;
+    ensure!(
+        topk_weight.len() >= routing.route_elems,
+        "topk_weight len must cover {}, got {}",
+        routing.route_elems,
+        topk_weight.len()
+    );
+    launch_marlin_wna16_gemm(
+        ctx,
+        workspace,
+        routing,
+        input,
+        weight.weight_packed_uint4b8,
+        weight.weight_scale_permuted,
+        topk_weight,
+        output_w13,
+        1,
+        false,
+        routing.active_tokens,
+        2 * KIMI_K2_EXPERT_INTERMEDIATE,
+        KIMI_K2_HIDDEN,
+    )
+}
+
+/// W2 (down) GEMM for PPLX path: top_k=1, no weight scaling.
+/// combine_recv handles the topk weight reduction.
+pub fn kimi_marlin_wna16_pplx_w2_gemm(
+    ctx: &DeviceContext,
+    workspace: &mut KimiMarlinWna16Workspace,
+    routing: &KimiMarlinRouting<'_>,
+    input: &HiddenStates,
+    weight: &KimiMarlinInt4Weight<'_>,
+    topk_weight: &CudaSlice<f32>,
+    output: &mut HiddenStates,
+) -> Result<()> {
+    weight.validate()?;
+    ensure!(
+        weight.manifest.role == KimiInt4ExpertRole::W2Down,
+        "Marlin W2 role mismatch: got {:?}",
+        weight.manifest.role
+    );
+    workspace.validate_for(routing, KIMI_K2_HIDDEN)?;
+    validate_hidden_states(
+        "pplx_marlin_w2.input",
+        input,
+        KIMI_K2_EXPERT_INTERMEDIATE,
+        routing.route_elems,
+    )?;
+    validate_hidden_states(
+        "pplx_marlin_w2.output",
+        output,
+        KIMI_K2_HIDDEN,
+        routing.route_elems,
+    )?;
+    ensure!(
+        topk_weight.len() >= routing.route_elems,
+        "topk_weight len must cover {}, got {}",
+        routing.route_elems,
+        topk_weight.len()
+    );
+    launch_marlin_wna16_gemm(
+        ctx,
+        workspace,
+        routing,
+        input,
+        weight.weight_packed_uint4b8,
+        weight.weight_scale_permuted,
+        topk_weight,
+        output,
+        1,
+        false,
+        routing.route_elems,
+        KIMI_K2_HIDDEN,
+        KIMI_K2_EXPERT_INTERMEDIATE,
+    )
 }
 
 fn launch_marlin_wna16_gemm(
