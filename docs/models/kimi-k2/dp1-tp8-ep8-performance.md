@@ -1,0 +1,118 @@
+# Kimi-K2 DP1 TP8 EP8 Performance
+
+> **TL;DR:** DP1 TP8 EP8 的性能主线从 correctness baseline
+> `72c770b` 开始。目标是在 H20 ×8、bs64、decode-heavy 服务口径下超过
+> vLLM `0.19.0` 的 bs64 baseline：output `583.9 tok/s`，TPOT median
+> `109.00ms`。
+>
+> **Status:** Project doc opened. No performance optimization is accepted here
+> until it has a correctness gate and its own commit.
+
+## Target
+
+| Item | Target / baseline |
+| --- | --- |
+| Machine | `h20-100`, 8× NVIDIA H20 |
+| Model | `/data/models/Kimi-K2.5` |
+| Shape | DP1 TP8 EP8 |
+| Primary workload | `input_len=1`, `output_len=128`, `ignore-eos`, `bs=64` |
+| vLLM baseline | TP1 DP8 EP8, `vllm bench serve`, output `583.9 tok/s`, TPOT median `109.00ms`, TPOT p99 `109.76ms` |
+| PegaInfer goal | output tok/s `> 583.9` at bs64, while preserving token correctness |
+
+The comparison target comes from [vllm-h20-baseline.md](vllm-h20-baseline.md).
+The correctness ground truth starts from
+[pplx-ep-correctness.md](pplx-ep-correctness.md): TP8 NCCL and TP8 PPLX both
+produce 64-token hash `4920f088c2338236` for the baseline probe.
+
+## Gate Rules
+
+Every kept optimization needs all of these recorded before commit:
+
+| Gate | Requirement |
+| --- | --- |
+| Correctness | Record the exact command, output file, token hash, and comparison target. For TP8/PPLX changes, compare against the TP8 NCCL baseline unless a stronger reference is documented. |
+| Performance | Record bs64 service numbers and the lower-level in-process probe that explains the delta. |
+| Scope | State whether the optimization targets frontend/scheduler, CUDA graph, collectives, MLA, MoE, or sampling. |
+| Revert line | Record the measurable regression that would make the change revert-worthy. |
+| Commit | Commit the code and this doc update together. |
+
+No optimization is accepted on performance numbers alone.
+
+## Baseline Commands
+
+PegaInfer server shape for this project:
+
+```bash
+cd /root/develop/xingming/pegainfer
+CUDA_HOME=/usr/local/cuda \
+NVCC=/usr/local/cuda/bin/nvcc \
+LD_LIBRARY_PATH=/tmp/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
+PEGAINFER_CUDA_SM=90a \
+PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer/.triton-venv/bin/python \
+PEGAINFER_KIMI_PARALLEL=tp8dp1 \
+cargo run --release -p pegainfer-server --features kimi-k2-pplx-ep -- \
+  --model-path /data/models/Kimi-K2.5 \
+  --port 8124 \
+  --cuda-graph true
+```
+
+Service benchmark:
+
+```bash
+vllm bench serve \
+  --backend openai \
+  --model /data/models/Kimi-K2.5 \
+  --tokenizer /data/models/Kimi-K2.5 \
+  --trust-remote-code \
+  --base-url http://127.0.0.1:8124 \
+  --endpoint /v1/completions \
+  --dataset-name random \
+  --random-input-len 1 \
+  --random-output-len 128 \
+  --random-range-ratio 0 \
+  --num-prompts 256 \
+  --max-concurrency 64 \
+  --ignore-eos \
+  --percentile-metrics ttft,tpot,itl \
+  --metric-percentiles 50,95,99
+```
+
+Correctness probe:
+
+```bash
+cd /root/develop/xingming/pegainfer
+CUDA_HOME=/usr/local/cuda \
+NVCC=/usr/local/cuda/bin/nvcc \
+LD_LIBRARY_PATH=/tmp/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
+PEGAINFER_CUDA_SM=90a \
+PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer/.triton-venv/bin/python \
+PEGAINFER_KIMI_PARALLEL=tp8dp1 \
+cargo run --release -p pegainfer-server --features kimi-k2-pplx-ep --bin bench_serving -- \
+  --model-path /data/models/Kimi-K2.5 \
+  --cuda-graph false \
+  --format json \
+  --out /tmp/kimi_pplx_tp8_correctness64.json \
+  request --output-len 64 --warmup 0 --iters 1
+```
+
+## Optimization Ledger
+
+| ID | Date | Commit | Area | Change | Correctness gate | bs64 result | Decision |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| B0 | 2026-05-25 | `72c770b` | correctness | TP8 PPLX baseline fixed; no performance claim | TP8 NCCL/PPLX 64-token hash `4920f088c2338236` | Not measured | Keep as ground truth |
+
+## Candidate Queue
+
+| Priority | Area | Hypothesis | Correctness risk |
+| --- | --- | --- | --- |
+| P0 | scheduler | Lift DP1 TP8 batch cap past 4 and validate bs64 admission/KV lifetime. | High: per-row token/KV ownership and sampling selection. |
+| P0 | CUDA Graph | Capture or bucket bs64 decode so host fanout does not dominate. | Medium: graph replay must preserve per-row metadata and PPLX participation. |
+| P1 | frontend | Measure HTTP/streaming overhead separately from in-process TPOT. | Low for model math, medium for serving semantics. |
+| P1 | collectives | Profile TP all-reduce and routed combine tail at bs64. | Medium: BF16/F32 collective boundary is correctness-sensitive. |
+| P2 | MLA/MoE | Retune batch-shape kernels only after scheduler and graph bottlenecks are visible. | High: routed expert and MLA cache layout are easy to perturb. |
+
+## Rejected / Deferred
+
+| Date | Idea | Reason |
+| --- | --- | --- |
+| 2026-05-25 | Use TP1/DP8 correctness as the baseline for this doc | Deferred. TP1/DP8 matched short probes but diverged at 32 tokens, so DP1 TP8 work uses TP8 NCCL/PPLX baseline first. |
