@@ -140,14 +140,14 @@ fn pplx_recv_capacity(max_total_tokens: usize) -> Result<usize> {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn forward_moe_layer_decode_pplx(
+#[allow(clippy::too_many_arguments)]
+pub(super) fn forward_moe_layer_decode_pplx_normed(
     ctx: &DeviceContext,
     aux_ctx: &DeviceContext,
     comm: Option<&Comm>,
     ep: &mut EpBackend,
     layer_idx: usize,
     moe: &KimiMoeForwardCache,
-    post_attention_norm: &NormWeight<KIMI_K2_HIDDEN>,
     expert_kernels: &KimiRankExpertMarlinWeights,
     scratch: &mut KimiWorkerDecodeScratch,
     pplx: &mut KimiMoePplxScratch,
@@ -158,14 +158,6 @@ pub(super) fn forward_moe_layer_decode_pplx(
     // Shared expert (main stream) + router (aux stream) both consume the
     // post-attention normed hidden state, so start router as soon as norm is
     // ready instead of waiting for shared expert/all-reduce to finish.
-    typed_ops::rms_norm_into(
-        ctx,
-        &scratch.mla.hidden,
-        post_attention_norm,
-        KIMI_K2_RMS_NORM_EPS,
-        &mut scratch.mla.normed,
-    )?;
-
     let norm_ready = ctx
         .stream
         .record_event(None)

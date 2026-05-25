@@ -43,23 +43,20 @@ pub(super) fn forward_decode_batch_next_token_kernels(
             &mut decode_arena.scratch.comm.hidden_allreduce_f32,
             comm,
         )?;
-        typed_ops::add_into(
+        typed_ops::fused_add_rms_norm_round_into(
             device_ctx,
-            &decode_arena.scratch.mla.hidden,
+            &mut decode_arena.scratch.mla.hidden,
             &decode_arena.scratch.mla.projected,
+            &layer.attention.post_attention_norm,
+            KIMI_K2_RMS_NORM_EPS,
             &mut decode_arena.scratch.mla.normed,
         )?;
-        std::mem::swap(
-            &mut decode_arena.scratch.mla.hidden,
-            &mut decode_arena.scratch.mla.normed,
-        );
         match &layer.kind {
             KimiLayerForwardKindCache::Dense(dense) => {
-                forward_dense_mlp_decode_into(
+                forward_dense_mlp_decode_normed_into(
                     device_ctx,
                     comm,
                     dense,
-                    &layer.attention.post_attention_norm,
                     &mut decode_arena.scratch,
                 )
                 .with_context(|| {
@@ -71,14 +68,13 @@ pub(super) fn forward_decode_batch_next_token_kernels(
                 if let Some(pplx_ctx) = pplx.as_mut() {
                     let arena_seq_len = decode_arena.scratch.mla.hidden.seq_len;
                     decode_arena.scratch.set_moe_seq_len(active_len)?;
-                    let pplx_result = crate::runner::moe_pplx::forward_moe_layer_decode_pplx(
+                    let pplx_result = crate::runner::moe_pplx::forward_moe_layer_decode_pplx_normed(
                         device_ctx,
                         decode_aux_ctx,
                         comm,
                         pplx_ctx.ep,
                         layer.layer_idx,
                         moe,
-                        &layer.attention.post_attention_norm,
                         expert_kernels,
                         &mut decode_arena.scratch,
                         pplx_ctx.scratch,
@@ -89,13 +85,12 @@ pub(super) fn forward_decode_batch_next_token_kernels(
                         format!("Kimi MoE PPLX batch decode layer {}", layer.layer_idx)
                     })?;
                 } else {
-                    forward_moe_layer_decode_into(
+                    forward_moe_layer_decode_normed_into(
                         device_ctx,
                         decode_aux_ctx,
                         comm,
                         layer.layer_idx,
                         moe,
-                        &layer.attention.post_attention_norm,
                         expert_kernels,
                         &mut decode_arena.scratch,
                     )
@@ -103,13 +98,12 @@ pub(super) fn forward_decode_batch_next_token_kernels(
                 }
                 #[cfg(not(feature = "pplx-ep"))]
                 {
-                    forward_moe_layer_decode_into(
+                    forward_moe_layer_decode_normed_into(
                         device_ctx,
                         decode_aux_ctx,
                         comm,
                         layer.layer_idx,
                         moe,
-                        &layer.attention.post_attention_norm,
                         expert_kernels,
                         &mut decode_arena.scratch,
                     )
@@ -467,20 +461,12 @@ pub(super) fn forward_dense_mlp_prefill_scratch_into(
     Ok(())
 }
 
-pub(super) fn forward_dense_mlp_decode_into(
+pub(super) fn forward_dense_mlp_decode_normed_into(
     ctx: &DeviceContext,
     comm: Option<&Comm>,
     dense: &KimiDenseForwardCache,
-    post_attention_norm: &NormWeight<KIMI_K2_HIDDEN>,
     scratch: &mut KimiWorkerDecodeScratch,
 ) -> Result<()> {
-    typed_ops::rms_norm_into(
-        ctx,
-        &scratch.mla.hidden,
-        post_attention_norm,
-        KIMI_K2_RMS_NORM_EPS,
-        &mut scratch.mla.normed,
-    )?;
     typed_ops::gemm_dm_typed_to_hs_graphsafe(
         ctx,
         &dense.gate_up_proj,
@@ -821,35 +807,46 @@ pub(super) fn forward_moe_layer_prefill_scratch_into(
     Ok(())
 }
 
-pub(super) fn forward_moe_layer_decode_into(
+#[allow(clippy::too_many_arguments)]
+pub(super) fn forward_moe_layer_decode_normed_into(
     ctx: &DeviceContext,
     aux_ctx: &DeviceContext,
     comm: Option<&Comm>,
     layer_idx: usize,
     moe: &KimiMoeForwardCache,
-    post_attention_norm: &NormWeight<KIMI_K2_HIDDEN>,
+    expert_kernels: &KimiRankExpertMarlinWeights,
+    scratch: &mut KimiWorkerDecodeScratch,
+) -> Result<()> {
+    let norm_ready = ctx
+        .stream
+        .record_event(None)
+        .with_context(|| format!("Kimi MoE layer {layer_idx} record fused norm_ready"))?;
+    aux_ctx
+        .stream
+        .wait(&norm_ready)
+        .with_context(|| format!("Kimi MoE layer {layer_idx} aux wait fused norm_ready"))?;
+    forward_moe_layer_decode_normed_after_event_into(
+        ctx,
+        aux_ctx,
+        comm,
+        layer_idx,
+        moe,
+        expert_kernels,
+        scratch,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn forward_moe_layer_decode_normed_after_event_into(
+    ctx: &DeviceContext,
+    aux_ctx: &DeviceContext,
+    comm: Option<&Comm>,
+    layer_idx: usize,
+    moe: &KimiMoeForwardCache,
     expert_kernels: &KimiRankExpertMarlinWeights,
     scratch: &mut KimiWorkerDecodeScratch,
 ) -> Result<()> {
     let seq_len = scratch.mla.hidden.seq_len;
-
-    // Shared expert path (main stream)
-    typed_ops::rms_norm_into(
-        ctx,
-        &scratch.mla.hidden,
-        post_attention_norm,
-        KIMI_K2_RMS_NORM_EPS,
-        &mut scratch.mla.normed,
-    )?;
-    let norm_ready = ctx
-        .stream
-        .record_event(None)
-        .with_context(|| format!("Kimi MoE layer {layer_idx} record norm_ready"))?;
-    aux_ctx
-        .stream
-        .wait(&norm_ready)
-        .with_context(|| format!("Kimi MoE layer {layer_idx} aux wait norm_ready"))?;
-
     typed_ops::gemm_dm_typed_to_hs_graphsafe(
         ctx,
         &moe.shared_gate_up_proj,

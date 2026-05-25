@@ -305,12 +305,14 @@ fn push_attention_layer(
         batch,
         "bf16_via_f32",
     ));
-    calls.push(add(&format!("{prefix}.residual"), batch));
+    calls.push(fused_add_rms_round(
+        &format!("{prefix}.residual_post_attention_norm"),
+        batch,
+    ));
 }
 
 fn push_dense_layer(calls: &mut Vec<KernelCall>, layer_idx: usize, batch: usize) {
     let prefix = format!("L{layer_idx}.dense");
-    calls.push(rms(&format!("{prefix}.post_attention_norm"), batch));
     calls.push(gemm(
         &format!("{prefix}.gate_up"),
         2 * LOCAL_DENSE_INTERMEDIATE,
@@ -339,7 +341,6 @@ fn push_dense_layer(calls: &mut Vec<KernelCall>, layer_idx: usize, batch: usize)
 
 fn push_moe_layer(calls: &mut Vec<KernelCall>, layer_idx: usize, batch: usize) {
     let prefix = format!("L{layer_idx}.moe");
-    calls.push(rms(&format!("{prefix}.post_attention_norm"), batch));
     calls.push(gemm(
         &format!("{prefix}.shared_gate_up"),
         2 * LOCAL_SHARED_INTERMEDIATE,
@@ -519,6 +520,15 @@ fn add(label: &str, batch: usize) -> KernelCall {
         .input("a", hidden(KIMI_K2_HIDDEN, batch))
         .input("b", hidden(KIMI_K2_HIDDEN, batch))
         .output("out", hidden(KIMI_K2_HIDDEN, batch))
+}
+
+fn fused_add_rms_round(label: &str, batch: usize) -> KernelCall {
+    KernelCall::new("fused_add_rms_norm_round_batch", label)
+        .input("hidden", hidden(KIMI_K2_HIDDEN, batch))
+        .input("residual", hidden(KIMI_K2_HIDDEN, batch))
+        .input("weight", vector_bf16("hidden", KIMI_K2_HIDDEN))
+        .output("hidden", hidden(KIMI_K2_HIDDEN, batch))
+        .output("normed", hidden(KIMI_K2_HIDDEN, batch))
 }
 
 fn all_reduce(label: &str, hidden_dim: usize, batch: usize, dtype: &str) -> KernelCall {

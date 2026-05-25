@@ -11,7 +11,8 @@ use pegainfer_kernels::{
         KimiMarlinFusedW13Int4Weight, KimiMarlinInt4Weight, KimiMarlinRouteWorkspace,
         KimiMarlinWna16Workspace, KimiMlaPagedKvLayout, KimiRouterBatch, KimiRouterConfig,
         KimiRouterOutput, KimiRouterScratch, add_batch_into, embedding_batch_vocab_shard,
-        flashinfer_top1_batch_into, flashinfer_topk_row_states_bytes, gemm_graphsafe_into_checked,
+        flashinfer_top1_batch_into, flashinfer_topk_row_states_bytes,
+        fused_add_rms_norm_round_batch_into, gemm_graphsafe_into_checked,
         kimi_add_f32_bf16_to_bf16, kimi_flashinfer_batch_decode_mla, kimi_marlin_sum_topk_rows_f32,
         kimi_marlin_w13_swiglu, kimi_marlin_wna16_w2_gemm, kimi_marlin_wna16_w13_gemm,
         kimi_mla_absorb_q_nope, kimi_mla_rope_split_decode, kimi_mla_split_qkv_a, kimi_mla_v_up,
@@ -49,6 +50,7 @@ pub fn measure_call(call: &KernelCall, iters: u64) -> Result<MeasuredCall> {
     let stats = match call.op.as_str() {
         "gemm_graphsafe" => Some(measure_gemm(call, iters)?),
         "rms_norm_batch" => Some(measure_rms_norm(call, iters)?),
+        "fused_add_rms_norm_round_batch" => Some(measure_fused_add_rms_norm_round(call, iters)?),
         "silu_mul_batch" => Some(measure_silu(call, iters)?),
         "add_batch" => Some(measure_add(call, iters)?),
         "scale_f32_in_place" => Some(measure_scale_f32(call, iters)?),
@@ -189,6 +191,27 @@ fn measure_rms_norm(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
             &mut out,
         );
         Ok(())
+    })
+}
+
+fn measure_fused_add_rms_norm_round(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
+    let hidden_spec = input(call, "hidden")?;
+    let hidden_dim = axis(hidden_spec, "hidden")?;
+    let batch = axis(hidden_spec, "batch")?;
+    let ctx = DeviceContext::new()?;
+    let mut hidden = HiddenStates::zeros(&ctx, hidden_dim, batch)?;
+    let residual = HiddenStates::zeros(&ctx, hidden_dim, batch)?;
+    let weight = DeviceVec::zeros(&ctx, hidden_dim)?;
+    let mut out = HiddenStates::zeros(&ctx, hidden_dim, batch)?;
+    measure_loop(&ctx, iters, || {
+        fused_add_rms_norm_round_batch_into(
+            &ctx,
+            &mut hidden,
+            &residual,
+            &weight,
+            crate::config::KIMI_K2_RMS_NORM_EPS,
+            &mut out,
+        )
     })
 }
 

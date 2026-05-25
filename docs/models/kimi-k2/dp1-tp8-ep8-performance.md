@@ -211,6 +211,7 @@ PEGAINFER_KIMI_PARALLEL=tp8dp1 \
 | O3 | 2026-05-25 | this commit | scheduler / prompt_len=1 prefill | Reuse prompt_len=1 dense/shared/router/Marlin scratch for the single-row prefill path, and widen the fixed admission coalesce window to `100ms` so bs64 pressure is admitted as one wave | `/tmp/kimi_pplx_tp8_o3_scratch_coalesce_o5.json` vs `/tmp/kimi_nccl_tp8_active64_o5_final.json`: 0 mismatches; hash counter `32x 7c4c5d83355198fd`, `32x 9eecc1ca6fb3409d` | `/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_o3_scratch_coalesce_candidate.json`: output `492.34 tok/s`, TPOT p50/p95/p99 `121.05/124.99/125.58ms`, TTFT p50/p99 `0.67/3.96s`, 256/256 success | Keep as a measured bs64 improvement; still below vLLM, next work should attack service TPOT/ITL and PPLX steady decode |
 | O5 | 2026-05-25 | this commit | PPLX / MoE stream overlap | Start the PPLX decode router on the aux stream immediately after RMSNorm, matching the NCCL decode overlap window instead of waiting for shared expert/all-reduce | `/tmp/kimi_pplx_tp8_o5_router_overlap_o5.json` vs `/tmp/kimi_nccl_tp8_active64_o5_final.json`: 0 mismatches; hash counter `32x 7c4c5d83355198fd`, `32x 9eecc1ca6fb3409d` | `/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_o5_router_overlap_candidate.json`: output `509.89 tok/s`, TPOT p50/p95/p99 `116.53/120.45/121.44ms`, TTFT p50/p99 `0.67/3.95s`, 256/256 success | Keep as a measured PPLX decode improvement; still below vLLM, next work should remove PPLX TP8 dispatch/copy overhead |
 | O7 | 2026-05-25 | this commit | PPLX / dispatch recv | Add a metadata/counts-only `dispatch_recv` path for TP8 decode, where local experts no longer consume the dispatched hidden payload | `/tmp/kimi_pplx_tp8_counts_recv_short_v2.json` vs `/tmp/kimi_nccl_tp8_active64_o5_final.json`: 0 mismatches; hash counter `32x 7c4c5d83355198fd`, `32x 9eecc1ca6fb3409d` | `/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_counts_recv_v2.json`: output `511.78 tok/s`, TPOT p50/p95/p99 `115.83/120.26/121.26ms`, TTFT p50/p99 `0.67/4.07s`, 256/256 success; in-process bs64/o128 reached `589.98 tok/s`, TPOT p50 `101.58ms` | Keep as a measured PPLX decode improvement; still below vLLM service target, next work should remove dispatch-send payload or compact scatter |
+| O8 | 2026-05-25 | this commit | compute / RMSNorm fusion | Fuse attention residual add with post-attention RMSNorm using a Kimi-specific kernel that first materializes the BF16-rounded residual sum | `/tmp/kimi_pplx_tp8_fused_addrms_round_bs64_o128.json` vs `/tmp/kimi_pplx_tp8_counts_recv_micro_bs64_o128_warm1_v2.json`: 0 output128 mismatches; hash counter `32x 82a791616c737442`, `16x 4ae8834e96c7d195`, `16x 24b2b3856ac0ea3a` | `/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_fused_addrms_round.json`: output `516.44 tok/s`, TPOT p50/p95/p99 `114.92/118.95/119.57ms`, TTFT p50/p95/p99 `0.66/3.81/3.97s`, 256/256 success; in-process bs64/o128 steady TPOT p50 `101.57ms` | Keep. This recovers the add+rms launch/memory win that R4 attempted, without changing token traces. |
 
 ### B1 Profile Notes
 
@@ -941,6 +942,104 @@ Revert this change if canonical bs64 output falls below O5's `509.89 tok/s`, if
 in-process steady TPOT p50 regresses above O5's `102.84ms`, or if the TP8
 NCCL/PPLX short-trace gate shows any mismatch.
 
+### O8 Exact Attention Residual + Post-Attention RMSNorm Fusion
+
+Profile:
+
+```text
+/tmp/kimi_fusion_model_report_static_bs64_kv128_o7_baseline.json
+/tmp/kimi_fused_addrms_round_model_report_static_bs64_kv128.json
+```
+
+Observed:
+
+- O7 static bs64/kv128 local compute report had `61` attention residual
+  `add_batch` calls and `61` following post-attention `rms_norm_batch` calls.
+- The targeted separate slice was about `1002us` per rank/step:
+  attention residual add `504.35us`, dense/MoE post-attention norm
+  `497.64us`.
+- R4 proved the existing FlashInfer fused adapter cannot be used directly:
+  it lets the FP32 add value participate in RMSNorm and changed `32/64` short
+  token traces.
+
+Motivation / expected gain:
+
+The current decode loop always performs:
+
+```text
+projected all-reduce -> hidden = bf16(hidden + projected)
+post-attention normed = rms_norm(hidden)
+```
+
+The fusion should remove one kernel launch and one global-memory read per
+layer. To preserve correctness, the fused kernel first materializes the
+BF16-rounded residual sum and then computes RMSNorm from that rounded value,
+matching the separate `add_batch` then `rms_norm_batch` boundary.
+
+Microbench:
+
+```bash
+cd /root/develop/xingming/pegainfer
+CUDA_HOME=/usr/local/cuda \
+NVCC=/usr/local/cuda/bin/nvcc \
+LD_LIBRARY_PATH=/tmp/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
+PEGAINFER_CUDA_SM=90a \
+PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer/.triton-venv/bin/python \
+/root/.cargo/bin/cargo run --release -p pegainfer-kimi-k2 \
+  --features kernel-report,pplx-ep --bin kimi_model_report -- \
+  decode --source static --batch-size 64 --kv-len 128 --iters 32 \
+  --format json --out /tmp/kimi_fused_addrms_round_model_report_static_bs64_kv128.json
+```
+
+Result:
+
+- Schedule calls: `1765` -> `1704`.
+- `fused_add_rms_norm_round_batch`: `61` calls, total `533.57us`,
+  per-call `8.75us`.
+- Removed targeted separate calls: about `1001.99us`; measured local-compute
+  saving is about `468us` per rank/step.
+- Total measured local compute: `262.005ms` -> `261.310ms`.
+
+Correctness gate:
+
+```text
+/tmp/kimi_pplx_tp8_fused_addrms_round_bs64_o128.json
+/tmp/kimi_pplx_tp8_counts_recv_micro_bs64_o128_warm1_v2.json
+```
+
+Observed:
+
+- Strong bs64/output128 trace mismatches versus the O7 baseline: `0/64`.
+- Hash counter on both files: `32x 82a791616c737442`,
+  `16x 4ae8834e96c7d195`, `16x 24b2b3856ac0ea3a`.
+- Candidate in-process steady TPOT p50/p95/p99:
+  `101.57/102.86/103.95ms`.
+
+Performance gate:
+
+Canonical bs64 service result:
+
+```text
+/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_fused_addrms_round.log
+/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_fused_addrms_round.json
+```
+
+Observed:
+
+- Successful requests: `256/256`.
+- Output throughput: `516.44 tok/s` vs O7 `511.78 tok/s`.
+- Peak output throughput: `640.00 tok/s`.
+- TTFT p50/p95/p99: `0.66/3.81/3.97s`.
+- TPOT p50/p95/p99: `114.92/118.95/119.57ms`.
+- ITL p50/p95/p99: `110.76/114.13/118.88ms`.
+
+Decision:
+
+Keep. This accepts the same optimization target as R4 only after preserving the
+BF16 residual-sum boundary and passing the strong output128 token-trace gate.
+Revert this change if output128 trace parity fails, or if canonical bs64 output
+falls below O7's `511.78 tok/s`.
+
 ## R4: Fused Attention Residual + Post-Attention RMSNorm
 
 ### Profile
@@ -1124,7 +1223,7 @@ model-level reference that explicitly accepts this numerical boundary change.
 
 | Priority | Area | Hypothesis | Correctness risk |
 | --- | --- | --- | --- |
-| P0 | scheduler / prefill | Implement an exact batched `prompt_len=1` first-token path instead of 64 serial `prefill_request` calls. It must preserve the C1 TP8 NCCL token trace, unlike the rejected decode-substitution probe. | High: first-token KV state affects all following tokens. |
+| P0 | scheduler / prefill/decode | Make `prompt_len=1` first-token execution enter the batched decode-style path, because a one-token prompt is decode with KV append. Start by profiling which code still forces serial `prefill_request` work, then prove parity against the C1/O7 token traces before widening beyond microbatch 1. | High: first-token KV state affects all following tokens; the earlier decode-substitution probe changed `32/64` traces. |
 | P0 | PPLX / MoE | O7 removed the unused TP8 `dispatch_recv` hidden copy, but `dispatch_send` still moves a full hidden payload only to build metadata. Prototype route-only dispatch send and measure `pplx_a2a_bench` / nsys before changing model code. | High: dispatch still builds `token_offset`, `expert_offsets`, `padded_index`, and `combine_send_offset`; compare these hashes plus token trace. |
 | P0 | PPLX / MoE | TP8 PPLX scatters Marlin output into a compact PPLX buffer before `combine_send`. Add an indexed combine-send path that reads NCCL-layout rows through `routing.sorted_token_ids`, then verify that `kimi_scatter_marlin_routes_to_compact_kernel` disappears in nsys. | High: duplicate-source canonicalization and BF16 row order must remain trace-exact. |
 | P1 | CUDA Graph | Reduce bs64 first-step graph capture/replay and metadata overhead after kernel profile identifies host or graph-node cost. | Medium: graph replay must preserve per-row metadata and PPLX participation. |
@@ -1141,5 +1240,5 @@ model-level reference that explicitly accepts this numerical boundary change.
 | 2026-05-25 | Run the exact prompt_len=1 fast prefill path with microbatch `2` or larger | Rejected for now. The full-batch probe `/tmp/kimi_nccl_tp8_c1batch_o5.json` produced `42/64` mismatches and hash counter `40x 7c4c5d83355198fd`, `18x f45b2f0248e7059d`, `6x 9eecc1ca6fb3409d`. A block-size-8 A/B still failed (`/tmp/kimi_nccl_tp8_c1batch_block8_o5.json`). The sweep showed bs2 correct in isolation (`/tmp/kimi_nccl_tp8_c1batch_bs2_o5.json`) but bs4+ drifted, and the scheduler microbatch=2 candidate `/tmp/kimi_nccl_tp8_c1micro2_o5.json` still had `37/64` mismatches. The accepted O2 path therefore keeps `KIMI_PROMPT_LEN1_PREFILL_MICROBATCH=1` until seq_len>1 layer parity is proven. |
 | 2026-05-25 | Opportunistically coalesce multiple `EngineCoreOutputs` in `pegainfer-vllm-frontend` before msgpack/ZMQ send | Rejected after service pressure test. The protocol can carry many `EngineCoreOutput` values per message, and the candidate preserved request order/final outputs in unit tests, but the canonical bs64 service result regressed from O3 `492.34 tok/s` to `/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_o4_output_coalesce_candidate.json` output `487.70 tok/s`, TPOT p50/p95/p99 `122.29/126.70/127.57ms`. This indicates the remaining service gap is not dominated by one-msgpack-per-token-output framing. |
 | 2026-05-25 | Move the full routed expert/PPLX decode path to the aux stream after router | Rejected after correctness and microbench. The candidate preserved TP8 NCCL/PPLX short-token trace (`/tmp/kimi_pplx_tp8_o6_aux_routed_short.json` vs `/tmp/kimi_nccl_tp8_active64_o5_final.json`: 0 mismatches), but regressed the bs64/o128 in-process probe from O5 `582.89 tok/s`, TPOT p50/p95/p99 `102.84/104.09/105.48ms` to `/tmp/kimi_pplx_tp8_o6_aux_routed_micro_bs64_o128_warm1.json` `580.65 tok/s`, TPOT p50/p95/p99 `103.21/104.60/106.05ms`; service pressure was skipped because the lower-level gate already lost. |
-| 2026-05-25 | Fuse attention residual add with post-attention RMSNorm using the existing FlashInfer fused add+rmsnorm adapter | Rejected after microbench and correctness. Static bs64/kv128 operator reports changed the targeted local-compute slice from about `2932us` to `2735us`, only `~0.20ms` per rank, and `/tmp/kimi_pplx_tp8_fused_addrms_short.json` mismatched `/tmp/kimi_nccl_tp8_active64_o5_final.json` on `32/64` generated-token traces. The likely issue is different BF16 materialization/rounding than the current `add_batch` then `rms_norm_batch` sequence. |
+| 2026-05-25 | Fuse attention residual add with post-attention RMSNorm using the existing FlashInfer fused add+rmsnorm adapter | Rejected after microbench and correctness, not because the win was too small. Static bs64/kv128 operator reports changed the targeted local-compute slice from about `2932us` to `2735us`, only `~0.20ms` per rank, and `/tmp/kimi_pplx_tp8_fused_addrms_short.json` mismatched `/tmp/kimi_nccl_tp8_active64_o5_final.json` on `32/64` generated-token traces. The likely issue is different BF16 materialization/rounding than the current `add_batch` then `rms_norm_batch` sequence; O8 keeps an exact BF16-rounded variant instead. |
 | 2026-05-25 | Change router GEMM from `CUBLAS_COMPUTE_32F_PEDANTIC` to `FAST_16BF` or `COMPUTE_32F` | Rejected after a stronger output128 correctness gate. Static microbench improved router from `764us` to about `30us` per MoE layer and in-process TPOT p50 improved to `~44ms`, but both variants changed `32/64` output128 token traces versus `/tmp/kimi_pplx_tp8_counts_recv_micro_bs64_o128_warm1_v2.json`. The short output5 gate was too weak to catch this drift. |

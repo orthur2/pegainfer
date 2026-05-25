@@ -135,6 +135,45 @@ pub fn fused_add_rms_norm_into<const DIM: usize>(
     Ok(())
 }
 
+/// Fused `hidden = bf16(hidden + residual); out = rms_norm(hidden, w)`.
+///
+/// This preserves the BF16 rounding boundary of separate `add_into` followed by
+/// `rms_norm_into`, while still avoiding the second kernel launch.
+pub fn fused_add_rms_norm_round_into<const DIM: usize>(
+    ctx: &DeviceContext,
+    hidden: &mut GpuTensor<DIM>,
+    residual: &GpuTensor<DIM>,
+    w: &NormWeight<DIM>,
+    eps: f32,
+    out: &mut GpuTensor<DIM>,
+) -> Result<()> {
+    anyhow::ensure!(
+        hidden.seq_len == residual.seq_len && hidden.seq_len == out.seq_len,
+        "typed fused_add_rms_norm_round seq_len mismatch: hidden={}, residual={}, output={}",
+        hidden.seq_len,
+        residual.seq_len,
+        out.seq_len
+    );
+    let (h_ptr, _gh) = hidden.data.device_ptr_mut(&ctx.stream);
+    let (r_ptr, _gr) = residual.data.device_ptr(&ctx.stream);
+    let (w_ptr, _gw) = w.data.device_ptr(&ctx.stream);
+    let (o_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::fused_add_rms_norm_round_batched_cuda(
+            h_ptr as *mut ffi::Half,
+            r_ptr as *const ffi::Half,
+            w_ptr as *const ffi::Half,
+            o_ptr as *mut ffi::Half,
+            DIM as i32,
+            hidden.seq_len as i32,
+            eps,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result.result()?;
+    Ok(())
+}
+
 // ── Elementwise ──────────────────────────────────────────────────────
 
 /// `out = a + b` — same DIM enforced at compile time.

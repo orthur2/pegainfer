@@ -91,6 +91,17 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    pub fn fused_add_rms_norm_round_batched_cuda(
+        hidden: *mut Half,
+        residual: *const Half,
+        weight: *const Half,
+        out: *mut Half,
+        hidden_dim: i32,
+        batch_size: i32,
+        eps: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn silu_mul_triton_aot_cuda(
         gate: *const Half,
         up: *const Half,
