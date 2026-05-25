@@ -8,15 +8,15 @@
 
 | Item | Target |
 | --- | ---: |
-| Hardware | h20-100, 8x NVIDIA H20 |
-| Model | `/data/models/Kimi-K2.5` |
+| Hardware | 8x NVIDIA H20 |
+| Model | `$MODEL_DIR` |
 | Shape | TP1 DP8 EP8 |
 | Workload | prompt_len=1, output_len=128, max_concurrency=64, num_prompts=256 |
 | vLLM baseline | output `594.57 tok/s`, TTFT p50/p99 `161.30/303.20ms`, TPOT p50/p99 `107.20/109.20ms`, ITL p50 `108.92ms` |
 | Gate | `256/256` success, TPOT p50 `< 107.20ms`, TPOT p99 `< 109.20ms`, output `> 594.57 tok/s` |
 
-Baseline source: h20-100 rerun with explicit bs64 warmup on 2026-05-25:
-`/tmp/kimi-vllm-dp8-warmup-20260525/measure_bs64_o128_after_warmup.json`.
+Baseline source: H20 rerun with explicit bs64 warmup on 2026-05-25:
+`$RESULT_ROOT/kimi-vllm-dp8-warmup-20260525/measure_bs64_o128_after_warmup.json`.
 The older sweep in `docs/models/kimi-k2/vllm-h20-baseline.md` recorded bs64 TPOT p50/p99
 `109.00/109.76ms`; the warmup-after rerun is slightly faster but still the same
 100ms-class H20 shape.
@@ -41,56 +41,68 @@ For TP1 DP8, correctness checks must include uneven per-rank active rows and emp
 
 ## Unified Commands
 
-Build on h20-100:
+Path placeholders:
 
 ```bash
-cd /root/develop/xingming/pegainfer
+export PEGAINFER_DIR=/path/to/pegainfer
+export VLLM_DIR=/path/to/vllm_test
+export MODEL_DIR=/path/to/Kimi-K2.5
+export NCCL_LIB_DIR=/path/to/nccl-lib
+export EVAL_VENV=/path/to/eval-venv
+export RESULT_ROOT=/path/to/result-root
+export TRITON_PYTHON=$PEGAINFER_DIR/.triton-venv/bin/python
+```
+
+Build on an H20 node:
+
+```bash
+cd "$PEGAINFER_DIR"
 CUDA_HOME=/usr/local/cuda \
 NVCC=/usr/local/cuda/bin/nvcc \
-LD_LIBRARY_PATH=/tmp/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
+LD_LIBRARY_PATH="$NCCL_LIB_DIR:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" \
 PEGAINFER_CUDA_SM=90a \
-PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer/.triton-venv/bin/python \
-/root/.cargo/bin/cargo build --release -p pegainfer-server \
+PEGAINFER_TRITON_PYTHON="$TRITON_PYTHON" \
+cargo build --release -p pegainfer-server \
   --features kimi-k2-pplx-ep --bin pegainfer --bin bench_serving
 ```
 
 In-process bs64:
 
 ```bash
-cd /root/develop/xingming/pegainfer
+cd "$PEGAINFER_DIR"
 CUDA_HOME=/usr/local/cuda \
 NVCC=/usr/local/cuda/bin/nvcc \
-LD_LIBRARY_PATH=/tmp/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
+LD_LIBRARY_PATH="$NCCL_LIB_DIR:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" \
 PEGAINFER_CUDA_SM=90a \
-PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer/.triton-venv/bin/python \
+PEGAINFER_TRITON_PYTHON="$TRITON_PYTHON" \
 PEGAINFER_KIMI_PARALLEL=tp1dp8 \
 target/release/bench_serving \
-  --model-path /data/models/Kimi-K2.5 \
+  --model-path "$MODEL_DIR" \
   --cuda-graph false \
   --format json \
-  --out /tmp/kimi-tp1dp8/tp1dp8_bs64_o128_${COMMIT}.json \
+  --out "$RESULT_ROOT/kimi-tp1dp8/tp1dp8_bs64_o128_${COMMIT}.json" \
   request --prompt-len 1 --output-len 128 --concurrency 64 --warmup 1 --iters 1
 ```
 
 Service bs64, same client shape as vLLM:
 
 ```bash
-cd /root/develop/xingming/pegainfer
+cd "$PEGAINFER_DIR"
 CUDA_HOME=/usr/local/cuda \
 NVCC=/usr/local/cuda/bin/nvcc \
-LD_LIBRARY_PATH=/tmp/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
+LD_LIBRARY_PATH="$NCCL_LIB_DIR:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" \
 PEGAINFER_CUDA_SM=90a \
-PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer/.triton-venv/bin/python \
+PEGAINFER_TRITON_PYTHON="$TRITON_PYTHON" \
 PEGAINFER_KIMI_PARALLEL=tp1dp8 \
-target/release/pegainfer --model-path /data/models/Kimi-K2.5 --port 8124 --cuda-graph false
+target/release/pegainfer --model-path "$MODEL_DIR" --port 8124 --cuda-graph false
 ```
 
 ```bash
-source /root/develop/xingming/vllm_test/.venv/bin/activate
+source "$VLLM_DIR/.venv/bin/activate"
 vllm bench serve \
   --backend openai \
-  --model /data/models/Kimi-K2.5 \
-  --tokenizer /data/models/Kimi-K2.5 \
+  --model "$MODEL_DIR" \
+  --tokenizer "$MODEL_DIR" \
   --trust-remote-code \
   --base-url http://127.0.0.1:8124 \
   --endpoint /v1/completions \
@@ -107,28 +119,28 @@ vllm bench serve \
   --metric-percentiles 50,95,99 \
   --save-result \
   --save-detailed \
-  --result-dir /tmp/kimi-tp1dp8-service \
+  --result-dir "$RESULT_ROOT/kimi-tp1dp8-service" \
   --result-filename pegainfer_tp1dp8_bs64_${COMMIT}.json
 ```
 
 GSM8K accuracy smoke, concurrent OpenAI `/v1/completions` path:
 
 ```bash
-cd /root/develop/xingming/pegainfer
-source /tmp/kimi-lm-eval-venv/bin/activate
+cd "$PEGAINFER_DIR"
+source "$EVAL_VENV/bin/activate"
 lm_eval run --model local-completions \
-  --model_args "model=kimi-k2.5,base_url=http://127.0.0.1:8125/v1/completions,tokenizer_backend=huggingface,tokenizer=/data/models/Kimi-K2.5,tokenized_requests=False,trust_remote_code=True,max_length=4096,max_gen_toks=256,num_concurrent=16,timeout=300" \
+  --model_args "model=kimi-k2.5,base_url=http://127.0.0.1:8125/v1/completions,tokenizer_backend=huggingface,tokenizer=$MODEL_DIR,tokenized_requests=False,trust_remote_code=True,max_length=4096,max_gen_toks=256,num_concurrent=16,timeout=300" \
   --tasks gsm8k --num_fewshot 8 --batch_size 1 --limit 64 \
-  --output_path /tmp/kimi-tp1dp8-gsm8k-lm-eval-${COMMIT}-limit64-c16 \
+  --output_path "$RESULT_ROOT/kimi-tp1dp8-gsm8k-lm-eval-${COMMIT}-limit64-c16" \
   --log_samples
 ```
 
 vLLM TP1 DP8 EP8 baseline server:
 
 ```bash
-cd /root/develop/xingming/vllm_test
+cd "$VLLM_DIR"
 source .venv/bin/activate
-vllm serve /data/models/Kimi-K2.5 \
+vllm serve "$MODEL_DIR" \
   --trust-remote-code \
   --tensor-parallel-size 1 \
   --data-parallel-size 8 \
@@ -141,15 +153,15 @@ vllm serve /data/models/Kimi-K2.5 \
 ```
 
 Use the served model name on the client. vLLM 0.19.0 returns 404 for
-`--model /data/models/Kimi-K2.5` in the single-API-server setup.
+`--model $MODEL_DIR` in the single-API-server setup.
 
 ```bash
-cd /root/develop/xingming/vllm_test
+cd "$VLLM_DIR"
 source .venv/bin/activate
 vllm bench serve \
   --backend openai \
   --model kimi-k2.5 \
-  --tokenizer /data/models/Kimi-K2.5 \
+  --tokenizer "$MODEL_DIR" \
   --trust-remote-code \
   --base-url http://127.0.0.1:8123 \
   --endpoint /v1/completions \
@@ -166,35 +178,35 @@ vllm bench serve \
   --metric-percentiles 50,95,99 \
   --save-result \
   --save-detailed \
-  --result-dir /tmp/kimi-vllm-dp8-cmdcheck-20260525 \
+  --result-dir "$RESULT_ROOT/kimi-vllm-dp8-cmdcheck-20260525" \
   --result-filename api1_maxseq64_measure_bs64_o128_after_warmup_modelname.json
 ```
 
 nsys profile:
 
 ```bash
-cd /root/develop/xingming/pegainfer
-mkdir -p /tmp/kimi-profile
+cd "$PEGAINFER_DIR"
+mkdir -p "$RESULT_ROOT/kimi-profile"
 CUDA_HOME=/usr/local/cuda \
 NVCC=/usr/local/cuda/bin/nvcc \
-LD_LIBRARY_PATH=/tmp/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
+LD_LIBRARY_PATH="$NCCL_LIB_DIR:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" \
 PEGAINFER_CUDA_SM=90a \
-PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer/.triton-venv/bin/python \
+PEGAINFER_TRITON_PYTHON="$TRITON_PYTHON" \
 PEGAINFER_KIMI_PARALLEL=tp1dp8 \
 nsys profile --force-overwrite=true --trace=cuda,nvtx \
   --cuda-graph-trace=node --export=sqlite \
-  -o /tmp/kimi-profile/tp1dp8_bs64_o128_${COMMIT} \
+  -o "$RESULT_ROOT/kimi-profile/tp1dp8_bs64_o128_${COMMIT}" \
   target/release/bench_serving \
-    --model-path /data/models/Kimi-K2.5 \
+    --model-path "$MODEL_DIR" \
     --cuda-graph false \
     --cuda-profiler-capture \
     --format json \
-    --out /tmp/kimi-profile/tp1dp8_bs64_o128_${COMMIT}.json \
+    --out "$RESULT_ROOT/kimi-profile/tp1dp8_bs64_o128_${COMMIT}.json" \
     request --prompt-len 1 --output-len 128 --concurrency 64 --warmup 1 --iters 1
 
 uv run --no-project python tools/nsys_tail_stats.py \
-  /tmp/kimi-profile/tp1dp8_bs64_o128_${COMMIT}.sqlite \
-  --out /tmp/kimi-profile/tp1dp8_bs64_o128_${COMMIT}_tail.md
+  "$RESULT_ROOT/kimi-profile/tp1dp8_bs64_o128_${COMMIT}.sqlite" \
+  --out "$RESULT_ROOT/kimi-profile/tp1dp8_bs64_o128_${COMMIT}_tail.md"
 ```
 
 ## Optimization Log
@@ -239,15 +251,15 @@ Correctness constraints:
 
 Microbench:
 
-- Remote build passed on h20-100 at `0c23389`.
+- Remote build passed on H20 node at `0c23389`.
 - Smoke command:
 
 ```bash
 PEGAINFER_KIMI_PARALLEL=tp1dp8 target/release/bench_serving \
-  --model-path /data/models/Kimi-K2.5 \
+  --model-path $MODEL_DIR \
   --cuda-graph false \
   --format json \
-  --out /tmp/kimi-tp1dp8/tp1dp8_bs64_o5_64192bb_smoke.json \
+  --out $RESULT_ROOT/kimi-tp1dp8/tp1dp8_bs64_o5_64192bb_smoke.json \
   request --prompt-len 1 --output-len 5 --concurrency 64 --warmup 0 --iters 1
 ```
 
@@ -258,15 +270,15 @@ Correctness:
 
 - Smoke generated all 5 tokens for every request without PPLX collective mismatch or slot-state failure.
 - bs8/o8 deterministic smoke generated `8/8` full traces with one hash,
-  `/tmp/kimi-tp1dp8/prompt1_decode_admission_bs8_o8_correctness.json`.
+  `$RESULT_ROOT/kimi-tp1dp8/prompt1_decode_admission_bs8_o8_correctness.json`.
 - Scope: this proves scheduler/collective/slot safety for the prompt_len1 decode-admission path.
   It is not a full TP1 DP8 token-parity gate against vLLM or TP8 DP1; that reference trace still
   needs explicit mismatch counts before this shape becomes an accuracy baseline.
-- GSM8K lm-eval smoke on h20-100 at `f193af2`, TP1 DP8 service,
+- GSM8K lm-eval smoke on H20 node at `f193af2`, TP1 DP8 service,
   `num_concurrent=16`, `limit=64`, `num_fewshot=8`, `max_gen_toks=256`:
   strict-match and flexible-extract both `55/64 = 0.8594` (`stderr 0.0438`).
   Artifacts:
-  `/tmp/kimi-tp1dp8-gsm8k-lm-eval-f193af2-limit64-c16/kimi-k2.5/results_2026-05-25T16-02-38.986675.json`
+  `$RESULT_ROOT/kimi-tp1dp8-gsm8k-lm-eval-f193af2-limit64-c16/kimi-k2.5/results_2026-05-25T16-02-38.986675.json`
   and `samples_gsm8k_2026-05-25T16-02-38.986675.jsonl`.
 - Local coordinator tests cover sparse logical slots, prompt_len1 admission mixed with active rows,
   padding decode arena capacity, and ordinary prefill padding slot selection:
@@ -279,27 +291,27 @@ cargo test -r -p pegainfer-kimi-k2 --features pplx-ep runner::engine::tests --no
 ```
 
 - Local result: `5 passed`.
-- h20-100 result at `0c23389`: `5 passed`.
-- Mixed-arrival service test, `/tmp/kimi-tp1dp8-service/pegainfer_tp1dp8_mixed_arrival_prompt1_o64_0c23389.json`:
+- H20 result at `0c23389`: `5 passed`.
+- Mixed-arrival service test, `$RESULT_ROOT/kimi-tp1dp8-service/pegainfer_tp1dp8_mixed_arrival_prompt1_o64_0c23389.json`:
   `64/64` success with `--request-rate 16`, peak concurrent requests `54`, TTFT p50/p99
   `58.10/110.88ms`, TPOT p50/p99 `35.91/37.63ms`. This covers prompt_len1
   admissions landing while existing decode slots are active.
 
 Performance:
 
-- In-process, `/tmp/kimi-tp1dp8/tp1dp8_bs64_o128_0c23389_w1_i1.json`:
+- In-process, `$RESULT_ROOT/kimi-tp1dp8/tp1dp8_bs64_o128_0c23389_w1_i1.json`:
   `64/64` success, TTFT p50/p99 `74.62/77.19ms`, first decode p50/p99
   `38.23/38.24ms`, steady TPOT p50/p95/p99 `40.10/43.32/43.72ms`.
 - Service, same `vllm bench serve` client as vLLM,
-  `/tmp/kimi-tp1dp8-service/pegainfer_tp1dp8_bs64_o128_0c23389_after_warmup.json`:
+  `$RESULT_ROOT/kimi-tp1dp8-service/pegainfer_tp1dp8_bs64_o128_0c23389_after_warmup.json`:
   `256/256` success, output `1336.35 tok/s`, TTFT p50/p99 `105.31/127.81ms`,
   TPOT p50/p95/p99 `47.34/47.70/47.71ms`, ITL p50/p99 `47.84/50.69ms`.
 - vLLM warmup-after baseline,
-  `/tmp/kimi-vllm-dp8-warmup-20260525/measure_bs64_o128_after_warmup.json`:
+  `$RESULT_ROOT/kimi-vllm-dp8-warmup-20260525/measure_bs64_o128_after_warmup.json`:
   `256/256` success, output `594.57 tok/s`, TTFT p50/p99 `161.30/303.20ms`,
   TPOT p50/p95/p99 `107.20/109.00/109.20ms`, ITL p50/p99 `108.92/116.35ms`.
 
-vLLM baseline diagnosis, h20-100, vLLM `0.19.0`, NCCL/AgRs path:
+vLLM baseline diagnosis, H20 node, vLLM `0.19.0`, NCCL/AgRs path:
 
 - Startup sanity: `max_seq_len=4096` is confirmed in the log; active context is only
   about 129 tokens. Workers use `nccl==2.27.5` and `AgRsAll2AllManager`. `pplx` is
@@ -316,9 +328,9 @@ Pinned DP-rank controls explain the cliff:
 
 | Run | DP-rank distribution | Global output | TPOT p50/p99 | Artifact |
 | --- | --- | ---: | ---: | --- |
-| balanced | `8,8,8,8,8,8,8,8` | `1192.22 tok/s` | `48.41/48.95ms` | `/tmp/kimi-vllm-dp8-dplb-20260525/balanced_8x8/` |
-| one-rank over bucket | `9,8,8,8,8,8,8,7` | `640.94 tok/s` | `96.01/97.34ms` | `/tmp/kimi-vllm-dp8-dplb-20260525/skew_98888887/` |
-| observed-like skew | `8,9,9,9,8,7,7,7` | `612.12 tok/s` | `99.80/99.99ms` | `/tmp/kimi-vllm-dp8-dplb-20260525/skew_89998777/` |
+| balanced | `8,8,8,8,8,8,8,8` | `1192.22 tok/s` | `48.41/48.95ms` | `$RESULT_ROOT/kimi-vllm-dp8-dplb-20260525/balanced_8x8/` |
+| one-rank over bucket | `9,8,8,8,8,8,8,7` | `640.94 tok/s` | `96.01/97.34ms` | `$RESULT_ROOT/kimi-vllm-dp8-dplb-20260525/skew_98888887/` |
+| observed-like skew | `8,9,9,9,8,7,7,7` | `612.12 tok/s` | `99.80/99.99ms` | `$RESULT_ROOT/kimi-vllm-dp8-dplb-20260525/skew_89998777/` |
 
 Mechanism:
 
@@ -332,8 +344,8 @@ Mechanism:
   8 and local batch `9` uses bucket 16.
 - DP coordination pads every rank to the maximum padded size when CUDA Graph is
   active (`vllm/v1/worker/dp_utils.py:78-88,148-160`;
-  `gpu_model_runner.py:3616-3637`, verified on h20-100
-  `/root/develop/xingming/vllm_test/.venv/lib/python3.10/site-packages/vllm/v1/worker/gpu_model_runner.py`).
+  `gpu_model_runner.py:3616-3637`, verified on an H20 node
+  `$VLLM_DIR/.venv/lib/python3.10/site-packages/vllm/v1/worker/gpu_model_runner.py`).
   One rank at 9 therefore makes the whole DP group execute bucket 16.
 
 Decision for vLLM interpretation: the surprising 2x TPOT is a DPLB plus DP CUDA
