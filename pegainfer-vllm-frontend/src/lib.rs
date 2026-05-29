@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::TcpListener as StdTcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -7,14 +7,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow, bail};
 use axum::Json;
 use axum::Router;
-use axum::body::{Body, to_bytes};
+use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::{Request, State};
-use axum::http::{HeaderName, StatusCode};
+use axum::http::{HeaderName, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{RwLock, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use vllm_engine_core_client::protocol::handshake::EngineCoreReadyResponse;
@@ -37,22 +37,27 @@ use zeromq::{DealerSocket, PushSocket, SocketOptions, ZmqMessage};
 
 use pegainfer_engine::engine::{
     EngineControlError, EngineHandle, FinishReason, GenerateRequest, LoadLoraAdapterRequest,
-    TokenEvent, TokenLogprob,
+    TokenEvent, TokenLogprob, UnloadLoraAdapterRequest,
 };
 use pegainfer_engine::sampler::SamplingParams;
 
 const ENGINE_INDEX: u32 = 0;
 const PROXY_BODY_LIMIT: usize = 128 * 1024 * 1024;
+const LORA_ADAPTER_XARG: &str = "pegainfer_lora_adapter";
 
 #[derive(Clone)]
 struct LoraRouteState {
     handle: EngineHandle,
+    adapter_names: Arc<RwLock<HashSet<String>>>,
 }
 
 #[derive(Clone)]
 struct ProxyState {
     client: reqwest::Client,
     upstream_base_url: Arc<str>,
+    base_model_name: String,
+    served_model_names: Vec<String>,
+    adapter_names: Arc<RwLock<HashSet<String>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -65,15 +70,46 @@ struct LoadLoraAdapterHttpRequest {
     is_3d_lora_weight: bool,
 }
 
+#[derive(Debug, Deserialize)]
+struct UnloadLoraAdapterHttpRequest {
+    lora_name: String,
+    #[serde(default)]
+    lora_int_id: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LoraModule {
+    pub name: String,
+    pub path: PathBuf,
+}
+
 #[derive(Debug, Serialize)]
 struct ErrorBody {
     error: String,
 }
 
-pub fn lora_routes(handle: EngineHandle) -> Router {
+#[derive(Debug, Serialize)]
+struct ModelListBody {
+    object: &'static str,
+    data: Vec<ModelCardBody>,
+}
+
+#[derive(Debug, Serialize)]
+struct ModelCardBody {
+    id: String,
+    object: &'static str,
+    created: i64,
+    owned_by: &'static str,
+}
+
+pub fn lora_routes(handle: EngineHandle, adapter_names: Arc<RwLock<HashSet<String>>>) -> Router {
     Router::new()
         .route("/v1/load_lora_adapter", post(load_lora_adapter))
-        .with_state(LoraRouteState { handle })
+        .route("/v1/unload_lora_adapter", post(unload_lora_adapter))
+        .with_state(LoraRouteState {
+            handle,
+            adapter_names,
+        })
 }
 
 async fn load_lora_adapter(
@@ -86,9 +122,6 @@ async fn load_lora_adapter(
     if request.lora_path.as_os_str().is_empty() {
         return bad_request("lora_path must not be empty");
     }
-    if request.load_inplace {
-        return bad_request("load_inplace=true is not supported by Qwen3 LoRA PR1");
-    }
     if request.is_3d_lora_weight {
         return bad_request("is_3d_lora_weight=true is not supported by Qwen3 LoRA PR1");
     }
@@ -99,14 +132,63 @@ async fn load_lora_adapter(
         .load_lora_adapter(LoadLoraAdapterRequest {
             lora_name: request.lora_name,
             lora_path: request.lora_path,
+            load_inplace: request.load_inplace,
         })
         .await
     {
-        Ok(()) => (
-            StatusCode::OK,
-            format!("Success: LoRA adapter '{lora_name}' added successfully."),
+        Ok(()) => {
+            state.adapter_names.write().await.insert(lora_name.clone());
+            (
+                StatusCode::OK,
+                format!("Success: LoRA adapter '{lora_name}' added successfully."),
+            )
+                .into_response()
+        }
+        Err(EngineControlError::Unsupported(message)) => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorBody {
+                error: message.to_string(),
+            }),
         )
             .into_response(),
+        Err(EngineControlError::ChannelClosed) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorBody {
+                error: EngineControlError::ChannelClosed.to_string(),
+            }),
+        )
+            .into_response(),
+        Err(EngineControlError::OperationFailed(message)) => {
+            (StatusCode::BAD_REQUEST, Json(ErrorBody { error: message })).into_response()
+        }
+    }
+}
+
+async fn unload_lora_adapter(
+    axum::extract::State(state): axum::extract::State<LoraRouteState>,
+    Json(request): Json<UnloadLoraAdapterHttpRequest>,
+) -> Response {
+    if request.lora_name.is_empty() {
+        return bad_request("lora_name must not be empty");
+    }
+
+    let lora_name = request.lora_name.clone();
+    match state
+        .handle
+        .unload_lora_adapter(UnloadLoraAdapterRequest {
+            lora_name: request.lora_name,
+            lora_int_id: request.lora_int_id,
+        })
+        .await
+    {
+        Ok(()) => {
+            state.adapter_names.write().await.remove(&lora_name);
+            (
+                StatusCode::OK,
+                format!("Success: LoRA adapter '{lora_name}' removed successfully."),
+            )
+                .into_response()
+        }
         Err(EngineControlError::Unsupported(message)) => (
             StatusCode::NOT_FOUND,
             Json(ErrorBody {
@@ -306,6 +388,7 @@ impl LocalEngineBridge {
                 prompt_tokens,
                 params: convert_sampling(&sampling_params),
                 max_tokens: sampling_params.max_tokens as usize,
+                lora_adapter: lora_adapter_from_sampling_params(&sampling_params)?,
                 token_tx,
                 logprobs: requested_logprobs(&sampling_params),
                 echo: false,
@@ -372,12 +455,19 @@ pub async fn serve_model_with_lora_routes(
     handle: EngineHandle,
     model_id: impl Into<String>,
     served_model_name: Vec<String>,
+    lora_modules: Vec<LoraModule>,
     port: u16,
     max_model_len: u32,
     shutdown: CancellationToken,
 ) -> Result<()> {
     let model_id = model_id.into();
-    let lora_router = lora_routes(handle.clone());
+    let adapter_names = Arc::new(RwLock::new(HashSet::new()));
+    load_startup_lora_modules(&handle, &adapter_names, &lora_modules).await?;
+    let lora_router = lora_routes(handle.clone(), Arc::clone(&adapter_names));
+    let base_model_name = served_model_name
+        .first()
+        .cloned()
+        .unwrap_or_else(|| model_id.clone());
     let mut last_error = None;
     for attempt in 1..=5 {
         let internal_port = reserve_loopback_port()?;
@@ -426,8 +516,16 @@ pub async fn serve_model_with_lora_routes(
             "serving LoRA route proxy: public_port={}, upstream={}",
             port, upstream_base_url
         );
-        let proxy_result =
-            serve_lora_proxy(port, upstream_base_url, lora_router, shutdown.child_token()).await;
+        let proxy_result = serve_lora_proxy(
+            port,
+            upstream_base_url,
+            base_model_name.clone(),
+            served_model_name.clone(),
+            Arc::clone(&adapter_names),
+            lora_router,
+            shutdown.child_token(),
+        )
+        .await;
 
         internal_shutdown.cancel();
         let internal_result = internal_task
@@ -437,6 +535,31 @@ pub async fn serve_model_with_lora_routes(
     }
 
     Err(last_error.unwrap_or_else(|| anyhow!("internal vLLM server startup was not attempted")))
+}
+
+async fn load_startup_lora_modules(
+    handle: &EngineHandle,
+    adapter_names: &Arc<RwLock<HashSet<String>>>,
+    lora_modules: &[LoraModule],
+) -> Result<()> {
+    for module in lora_modules {
+        handle
+            .load_lora_adapter(LoadLoraAdapterRequest {
+                lora_name: module.name.clone(),
+                lora_path: module.path.clone(),
+                load_inplace: false,
+            })
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to load startup LoRA module {} from {}",
+                    module.name,
+                    module.path.display()
+                )
+            })?;
+        adapter_names.write().await.insert(module.name.clone());
+    }
+    Ok(())
 }
 
 async fn serve_model_on_host(
@@ -527,12 +650,18 @@ async fn wait_for_http_health(upstream_base_url: &str, shutdown: &CancellationTo
 async fn serve_lora_proxy(
     port: u16,
     upstream_base_url: Arc<str>,
+    base_model_name: String,
+    served_model_names: Vec<String>,
+    adapter_names: Arc<RwLock<HashSet<String>>>,
     lora_router: Router,
     shutdown: CancellationToken,
 ) -> Result<()> {
     let state = ProxyState {
         client: reqwest::Client::new(),
         upstream_base_url,
+        base_model_name,
+        served_model_names,
+        adapter_names,
     };
     let proxy_router = Router::new().fallback(proxy_to_upstream).with_state(state);
     let app = proxy_router.merge(lora_router);
@@ -561,14 +690,28 @@ async fn proxy_to_upstream(State(state): State<ProxyState>, request: Request) ->
 
 async fn proxy_to_upstream_inner(state: ProxyState, request: Request) -> Result<Response> {
     let (parts, body) = request.into_parts();
+    if parts.method == Method::GET && parts.uri.path() == "/v1/models" {
+        return Ok(lora_models_response(
+            &state.served_model_names,
+            &state.base_model_name,
+            &state.adapter_names,
+        )
+        .await);
+    }
     let path_and_query = parts
         .uri
         .path_and_query()
         .map_or("/", axum::http::uri::PathAndQuery::as_str);
     let upstream_url = format!("{}{}", state.upstream_base_url, path_and_query);
-    let body = to_bytes(body, PROXY_BODY_LIMIT)
+    let mut body = to_bytes(body, PROXY_BODY_LIMIT)
         .await
         .context("failed to read proxy request body")?;
+    if parts.method == Method::POST
+        && matches!(parts.uri.path(), "/v1/completions" | "/v1/chat/completions")
+    {
+        let _ = rewrite_lora_request_body(&mut body, &state.base_model_name, &state.adapter_names)
+            .await?;
+    }
 
     let mut upstream = state.client.request(parts.method, upstream_url);
     for (name, value) in &parts.headers {
@@ -594,6 +737,72 @@ async fn proxy_to_upstream_inner(state: ProxyState, request: Request) -> Result<
     builder
         .body(Body::from_stream(response.bytes_stream()))
         .context("failed to build proxy response")
+}
+
+async fn rewrite_lora_request_body(
+    body: &mut Bytes,
+    base_model_name: &str,
+    adapter_names: &Arc<RwLock<HashSet<String>>>,
+) -> Result<Option<String>> {
+    let mut value: serde_json::Value =
+        serde_json::from_slice(body).context("failed to parse OpenAI request JSON")?;
+    let Some(model) = value.get("model").and_then(serde_json::Value::as_str) else {
+        return Ok(None);
+    };
+    if model == base_model_name {
+        return Ok(None);
+    }
+    if !adapter_names.read().await.contains(model) {
+        return Ok(None);
+    }
+    let adapter = model.to_string();
+    value["model"] = serde_json::Value::String(base_model_name.to_string());
+    let Some(map) = value.as_object_mut() else {
+        return Ok(None);
+    };
+    let xargs = map
+        .entry("vllm_xargs")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !xargs.is_object() {
+        *xargs = serde_json::Value::Object(serde_json::Map::new());
+    }
+    xargs
+        .as_object_mut()
+        .expect("vllm_xargs must be object")
+        .insert(
+            LORA_ADAPTER_XARG.to_string(),
+            serde_json::Value::String(adapter.clone()),
+        );
+    *body = Bytes::from(serde_json::to_vec(&value)?);
+    Ok(Some(adapter))
+}
+
+async fn lora_models_response(
+    served_model_names: &[String],
+    base_model_name: &str,
+    adapter_names: &Arc<RwLock<HashSet<String>>>,
+) -> Response {
+    let mut ids: Vec<String> = if served_model_names.is_empty() {
+        vec![base_model_name.to_string()]
+    } else {
+        served_model_names.to_vec()
+    };
+    ids.extend(adapter_names.read().await.iter().cloned());
+    ids.sort();
+    ids.dedup();
+    Json(ModelListBody {
+        object: "list",
+        data: ids
+            .into_iter()
+            .map(|id| ModelCardBody {
+                id,
+                object: "model",
+                created: 0,
+                owned_by: "vllm-frontend-rs",
+            })
+            .collect(),
+    })
+    .into_response()
 }
 
 fn should_forward_request_header(name: &HeaderName) -> bool {
@@ -893,6 +1102,20 @@ fn requested_logprobs(params: &EngineCoreSamplingParams) -> usize {
         .unwrap_or(0)
 }
 
+fn lora_adapter_from_sampling_params(params: &EngineCoreSamplingParams) -> Result<Option<String>> {
+    let Some(extra_args) = params.extra_args.as_ref() else {
+        return Ok(None);
+    };
+    let Some(value) = extra_args.get(LORA_ADAPTER_XARG) else {
+        return Ok(None);
+    };
+    match value.as_str() {
+        Some(name) if !name.is_empty() => Ok(Some(name.to_string())),
+        Some(_) => bail!("{LORA_ADAPTER_XARG} must not be empty"),
+        None => bail!("{LORA_ADAPTER_XARG} must be a string"),
+    }
+}
+
 fn convert_finish_reason(reason: FinishReason) -> EngineCoreFinishReason {
     match reason {
         FinishReason::Length => EngineCoreFinishReason::Length,
@@ -961,12 +1184,17 @@ pub fn shutdown_token_from_ctrl_c() -> CancellationToken {
 mod tests {
     use super::*;
 
+    fn route_state(handle: EngineHandle) -> LoraRouteState {
+        LoraRouteState {
+            handle,
+            adapter_names: Arc::new(RwLock::new(HashSet::new())),
+        }
+    }
+
     #[tokio::test]
     async fn load_lora_adapter_route_reports_unsupported_engine() {
         let (submit_tx, _submit_rx) = mpsc::unbounded_channel::<GenerateRequest>();
-        let state = LoraRouteState {
-            handle: EngineHandle::new(submit_tx),
-        };
+        let state = route_state(EngineHandle::new(submit_tx));
         let response = load_lora_adapter(
             axum::extract::State(state),
             Json(LoadLoraAdapterHttpRequest {
@@ -984,21 +1212,120 @@ mod tests {
     #[tokio::test]
     async fn load_lora_adapter_route_rejects_pr1_unsupported_fields() {
         let (submit_tx, _submit_rx) = mpsc::unbounded_channel::<GenerateRequest>();
-        let state = LoraRouteState {
-            handle: EngineHandle::new(submit_tx),
-        };
+        let state = route_state(EngineHandle::new(submit_tx));
         let response = load_lora_adapter(
             axum::extract::State(state),
             Json(LoadLoraAdapterHttpRequest {
                 lora_name: "adapter-a".to_string(),
                 lora_path: PathBuf::from("/tmp/adapter-a"),
-                load_inplace: true,
-                is_3d_lora_weight: false,
+                load_inplace: false,
+                is_3d_lora_weight: true,
             }),
         )
         .await;
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn unload_lora_adapter_route_reports_unsupported_engine() {
+        let (submit_tx, _submit_rx) = mpsc::unbounded_channel::<GenerateRequest>();
+        let state = route_state(EngineHandle::new(submit_tx));
+        let response = unload_lora_adapter(
+            axum::extract::State(state),
+            Json(UnloadLoraAdapterHttpRequest {
+                lora_name: "adapter-a".to_string(),
+                lora_int_id: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn rewrite_lora_request_body_maps_adapter_model_to_base_and_xarg() {
+        let adapter_names = Arc::new(RwLock::new(HashSet::from(["adapter-a".to_string()])));
+        let mut body = Bytes::from(
+            serde_json::json!({
+                "model": "adapter-a",
+                "prompt": "hello"
+            })
+            .to_string(),
+        );
+
+        let selected = rewrite_lora_request_body(&mut body, "base-model", &adapter_names)
+            .await
+            .expect("rewrite request");
+
+        assert_eq!(selected.as_deref(), Some("adapter-a"));
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(value["model"], "base-model");
+        assert_eq!(value["prompt"], "hello");
+        assert_eq!(value["vllm_xargs"][LORA_ADAPTER_XARG], "adapter-a");
+    }
+
+    #[tokio::test]
+    async fn rewrite_lora_request_body_leaves_base_and_unknown_models_untouched() {
+        let adapter_names = Arc::new(RwLock::new(HashSet::from(["adapter-a".to_string()])));
+        let mut base_body = Bytes::from(r#"{"model":"base-model","prompt":"hello"}"#);
+        let selected = rewrite_lora_request_body(&mut base_body, "base-model", &adapter_names)
+            .await
+            .expect("base request");
+        assert_eq!(selected, None);
+        assert_eq!(
+            &base_body[..],
+            br#"{"model":"base-model","prompt":"hello"}"#
+        );
+
+        let mut unknown_body = Bytes::from(r#"{"model":"missing-adapter","prompt":"hello"}"#);
+        let selected = rewrite_lora_request_body(&mut unknown_body, "base-model", &adapter_names)
+            .await
+            .expect("unknown adapter request");
+        assert_eq!(selected, None);
+        assert_eq!(
+            &unknown_body[..],
+            br#"{"model":"missing-adapter","prompt":"hello"}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn lora_models_response_includes_base_and_loaded_adapters() {
+        let adapter_names = Arc::new(RwLock::new(HashSet::from([
+            "adapter-b".to_string(),
+            "adapter-a".to_string(),
+        ])));
+
+        let response =
+            lora_models_response(&["served-base".to_string()], "model-path", &adapter_names).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), PROXY_BODY_LIMIT)
+            .await
+            .expect("read body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("models JSON");
+        let ids = value["data"]
+            .as_array()
+            .expect("data array")
+            .iter()
+            .map(|entry| entry["id"].as_str().expect("id string"))
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["adapter-a", "adapter-b", "served-base"]);
+    }
+
+    #[test]
+    fn lora_adapter_from_sampling_params_reads_proxy_xarg() {
+        let mut params = EngineCoreSamplingParams::for_test();
+        params.extra_args = Some(HashMap::from([(
+            LORA_ADAPTER_XARG.to_string(),
+            serde_json::Value::String("adapter-a".to_string()),
+        )]));
+
+        assert_eq!(
+            lora_adapter_from_sampling_params(&params)
+                .expect("extract adapter")
+                .as_deref(),
+            Some("adapter-a")
+        );
     }
 
     #[tokio::test]

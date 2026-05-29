@@ -56,6 +56,7 @@ pub struct GenerateRequest {
     pub prompt_tokens: Vec<u32>,
     pub params: SamplingParams,
     pub max_tokens: usize,
+    pub lora_adapter: Option<String>,
     pub token_tx: mpsc::UnboundedSender<TokenEvent>,
     pub logprobs: usize,
     pub echo: bool,
@@ -65,12 +66,26 @@ pub struct GenerateRequest {
 pub struct LoadLoraAdapterRequest {
     pub lora_name: String,
     pub lora_path: PathBuf,
+    pub load_inplace: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnloadLoraAdapterRequest {
+    pub lora_name: String,
+    pub lora_int_id: Option<i64>,
 }
 
 pub enum EngineControlRequest {
     LoadLoraAdapter {
         request: LoadLoraAdapterRequest,
         response_tx: oneshot::Sender<std::result::Result<(), String>>,
+    },
+    UnloadLoraAdapter {
+        request: UnloadLoraAdapterRequest,
+        response_tx: oneshot::Sender<std::result::Result<(), String>>,
+    },
+    ListLoraAdapters {
+        response_tx: oneshot::Sender<std::result::Result<Vec<String>, String>>,
     },
 }
 
@@ -234,6 +249,54 @@ impl EngineHandle {
             )),
         }
     }
+
+    pub async fn list_lora_adapters(&self) -> EngineControlResult<Vec<String>> {
+        match self.inner.command_tx.as_ref() {
+            Some(command_tx) => {
+                let (response_tx, response_rx) = oneshot::channel();
+                command_tx
+                    .send(EngineCommand::Control(
+                        EngineControlRequest::ListLoraAdapters { response_tx },
+                    ))
+                    .map_err(|_| EngineControlError::ChannelClosed)?;
+
+                response_rx
+                    .await
+                    .map_err(|_| EngineControlError::ChannelClosed)?
+                    .map_err(EngineControlError::OperationFailed)
+            }
+            None => Err(EngineControlError::Unsupported(
+                "engine does not support dynamic LoRA adapter loading",
+            )),
+        }
+    }
+
+    pub async fn unload_lora_adapter(
+        &self,
+        request: UnloadLoraAdapterRequest,
+    ) -> EngineControlResult<()> {
+        match self.inner.command_tx.as_ref() {
+            Some(command_tx) => {
+                let (response_tx, response_rx) = oneshot::channel();
+                command_tx
+                    .send(EngineCommand::Control(
+                        EngineControlRequest::UnloadLoraAdapter {
+                            request,
+                            response_tx,
+                        },
+                    ))
+                    .map_err(|_| EngineControlError::ChannelClosed)?;
+
+                response_rx
+                    .await
+                    .map_err(|_| EngineControlError::ChannelClosed)?
+                    .map_err(EngineControlError::OperationFailed)
+            }
+            None => Err(EngineControlError::Unsupported(
+                "engine does not support dynamic LoRA adapter loading",
+            )),
+        }
+    }
 }
 
 impl Drop for EngineInner {
@@ -295,6 +358,7 @@ mod tests {
         let request = LoadLoraAdapterRequest {
             lora_name: "adapter-a".to_string(),
             lora_path: PathBuf::from("/tmp/adapter-a"),
+            load_inplace: false,
         };
         let load = tokio::spawn({
             let handle = handle.clone();
@@ -311,10 +375,48 @@ mod tests {
                 assert_eq!(actual, request);
                 response_tx.send(Ok(())).expect("send load result");
             }
+            EngineCommand::Control(EngineControlRequest::UnloadLoraAdapter { .. }) => {
+                panic!("expected LoRA load command")
+            }
+            EngineCommand::Control(EngineControlRequest::ListLoraAdapters { .. }) => {
+                panic!("expected LoRA load command")
+            }
             EngineCommand::Generate(_) => panic!("expected LoRA control command"),
         }
 
         load.await.expect("join load task").expect("load succeeded");
+    }
+
+    #[tokio::test]
+    async fn list_lora_adapters_sends_control_command() {
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel::<EngineCommand>();
+        let handle = EngineHandle::new_with_command_channel(command_tx);
+
+        let list = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.list_lora_adapters().await }
+        });
+
+        let command = command_rx.recv().await.expect("control command");
+        match command {
+            EngineCommand::Control(EngineControlRequest::ListLoraAdapters { response_tx }) => {
+                response_tx
+                    .send(Ok(vec!["adapter-a".to_string()]))
+                    .expect("send list result");
+            }
+            EngineCommand::Control(EngineControlRequest::LoadLoraAdapter { .. }) => {
+                panic!("expected LoRA list command")
+            }
+            EngineCommand::Control(EngineControlRequest::UnloadLoraAdapter { .. }) => {
+                panic!("expected LoRA list command")
+            }
+            EngineCommand::Generate(_) => panic!("expected LoRA control command"),
+        }
+
+        assert_eq!(
+            list.await.expect("join list task").expect("list succeeded"),
+            vec!["adapter-a"]
+        );
     }
 
     #[tokio::test]
@@ -325,6 +427,7 @@ mod tests {
             .load_lora_adapter(LoadLoraAdapterRequest {
                 lora_name: "adapter-a".to_string(),
                 lora_path: PathBuf::from("/tmp/adapter-a"),
+                load_inplace: false,
             })
             .await
             .expect_err("control should be unsupported");
@@ -332,5 +435,44 @@ mod tests {
             error,
             EngineControlError::Unsupported("engine does not support dynamic LoRA adapter loading")
         );
+    }
+
+    #[tokio::test]
+    async fn unload_lora_adapter_sends_control_command() {
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel::<EngineCommand>();
+        let handle = EngineHandle::new_with_command_channel(command_tx);
+
+        let request = UnloadLoraAdapterRequest {
+            lora_name: "adapter-a".to_string(),
+            lora_int_id: None,
+        };
+        let unload = tokio::spawn({
+            let handle = handle.clone();
+            let request = request.clone();
+            async move { handle.unload_lora_adapter(request).await }
+        });
+
+        let command = command_rx.recv().await.expect("control command");
+        match command {
+            EngineCommand::Control(EngineControlRequest::UnloadLoraAdapter {
+                request: actual,
+                response_tx,
+            }) => {
+                assert_eq!(actual, request);
+                response_tx.send(Ok(())).expect("send unload result");
+            }
+            EngineCommand::Control(EngineControlRequest::LoadLoraAdapter { .. }) => {
+                panic!("expected LoRA unload command")
+            }
+            EngineCommand::Control(EngineControlRequest::ListLoraAdapters { .. }) => {
+                panic!("expected LoRA unload command")
+            }
+            EngineCommand::Generate(_) => panic!("expected LoRA control command"),
+        }
+
+        unload
+            .await
+            .expect("join unload task")
+            .expect("unload succeeded");
     }
 }
