@@ -1,4 +1,81 @@
+use super::load::{
+    KimiRankSlicedLoadPlan, KimiShardTensorLoadPlan, KimiTensorLoadSlice, KimiTensorLoadSpec,
+};
 use super::*;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KimiTensorEntry {
+    pub name: String,
+    pub shard: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KimiAttentionManifest {
+    pub input_layernorm: KimiTensorEntry,
+    pub q_a_proj: KimiTensorEntry,
+    pub q_a_layernorm: KimiTensorEntry,
+    pub q_b_proj: KimiTensorEntry,
+    pub kv_a_proj_with_mqa: KimiTensorEntry,
+    pub kv_a_layernorm: KimiTensorEntry,
+    pub kv_b_proj: KimiTensorEntry,
+    pub o_proj: KimiTensorEntry,
+    pub post_attention_layernorm: KimiTensorEntry,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KimiDenseMlpManifest {
+    pub gate_proj: KimiTensorEntry,
+    pub up_proj: KimiTensorEntry,
+    pub down_proj: KimiTensorEntry,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KimiRouterManifest {
+    pub gate_weight: KimiTensorEntry,
+    pub e_score_correction_bias: KimiTensorEntry,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KimiSharedExpertManifest {
+    pub gate_proj: KimiTensorEntry,
+    pub up_proj: KimiTensorEntry,
+    pub down_proj: KimiTensorEntry,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KimiInt4ProjectionManifest {
+    pub weight_packed: KimiTensorEntry,
+    pub weight_scale: KimiTensorEntry,
+    pub weight_shape: KimiTensorEntry,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KimiRoutedExpertManifest {
+    pub expert_idx: usize,
+    pub gate_proj: KimiInt4ProjectionManifest,
+    pub up_proj: KimiInt4ProjectionManifest,
+    pub down_proj: KimiInt4ProjectionManifest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KimiMoeLayerManifest {
+    pub router: KimiRouterManifest,
+    pub shared_experts: KimiSharedExpertManifest,
+    pub routed_experts: Vec<KimiRoutedExpertManifest>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum KimiLayerKindManifest {
+    Dense(KimiDenseMlpManifest),
+    Moe(KimiMoeLayerManifest),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KimiLayerManifest {
+    pub layer_idx: usize,
+    pub attention: KimiAttentionManifest,
+    pub kind: KimiLayerKindManifest,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct KimiK2WeightManifest {
@@ -8,6 +85,99 @@ pub(crate) struct KimiK2WeightManifest {
     pub lm_head: KimiTensorEntry,
     pub layers: Vec<KimiLayerManifest>,
     pub parallel: KimiK2ParallelShape,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KimiRankWeightPlan {
+    pub tp_rank: usize,
+    pub ep_rank: usize,
+    pub attention_head_range: Range<usize>,
+    pub vocab_range: Range<usize>,
+    pub local_expert_range: Range<usize>,
+    pub tensor_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KimiTopWeightNames {
+    pub token_embedding: String,
+    pub final_norm: String,
+    pub lm_head: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KimiAttentionWeightNames {
+    pub input_layernorm: String,
+    pub q_a_proj: String,
+    pub q_a_layernorm: String,
+    pub q_b_proj: String,
+    pub kv_a_proj_with_mqa: String,
+    pub kv_a_layernorm: String,
+    pub kv_b_proj: String,
+    pub o_proj: String,
+    pub post_attention_layernorm: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KimiDenseMlpWeightNames {
+    pub gate_proj: String,
+    pub up_proj: String,
+    pub down_proj: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KimiRouterWeightNames {
+    pub gate_weight: String,
+    pub e_score_correction_bias: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KimiSharedExpertWeightNames {
+    pub gate_proj: String,
+    pub up_proj: String,
+    pub down_proj: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KimiInt4ProjectionWeightNames {
+    pub weight_packed: String,
+    pub weight_scale: String,
+    pub weight_shape: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KimiRoutedExpertWeightNames {
+    pub global_expert: usize,
+    pub gate_proj: KimiInt4ProjectionWeightNames,
+    pub up_proj: KimiInt4ProjectionWeightNames,
+    pub down_proj: KimiInt4ProjectionWeightNames,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KimiMoeLayerWeightNames {
+    pub router: KimiRouterWeightNames,
+    pub shared_experts: KimiSharedExpertWeightNames,
+    pub routed_experts: Vec<KimiRoutedExpertWeightNames>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum KimiLayerWeightKindNames {
+    Dense(KimiDenseMlpWeightNames),
+    Moe(KimiMoeLayerWeightNames),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KimiLayerWeightNames {
+    pub layer_idx: usize,
+    pub attention: KimiAttentionWeightNames,
+    pub kind: KimiLayerWeightKindNames,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KimiRankWeightNames {
+    pub rank: usize,
+    pub plan: KimiRankWeightPlan,
+    pub top: KimiTopWeightNames,
+    pub layers: Vec<KimiLayerWeightNames>,
 }
 
 impl KimiK2WeightManifest {
@@ -109,9 +279,9 @@ impl KimiK2WeightManifest {
             "Kimi rank {rank} outside EP{}",
             self.parallel.ep_world
         );
-        let coord = self.parallel.parallel_config().coord(rank);
-        let tp_rank = coord.tp_rank;
-        let ep_rank = coord.ep_rank;
+        let parallel = self.parallel.parallel_config();
+        let tp_rank = parallel.tp_rank(rank);
+        let ep_rank = parallel.ep_rank(rank);
         let attention_head_range =
             tp_rank * self.parallel.heads_per_tp..(tp_rank + 1) * self.parallel.heads_per_tp;
         let vocab_range =
@@ -311,59 +481,13 @@ impl KimiK2WeightManifest {
     }
 
     fn rank_local_expert_range(&self, rank: usize) -> Result<Range<usize>> {
-        let ep_rank = self.parallel.parallel_config().coord(rank).ep_rank;
+        let ep_rank = self.parallel.parallel_config().ep_rank(rank);
         ensure!(
             ep_rank < self.parallel.ep_world,
             "Kimi EP rank {ep_rank} outside EP{}",
             self.parallel.ep_world
         );
         Ok(ep_rank * self.parallel.local_experts..(ep_rank + 1) * self.parallel.local_experts)
-    }
-}
-
-impl KimiRankWeightNames {
-    fn required_tensor_names(&self) -> Result<Vec<&str>> {
-        let mut required = Vec::with_capacity(self.plan.tensor_count);
-        required.push(self.top.token_embedding.as_str());
-        required.push(self.top.final_norm.as_str());
-        required.push(self.top.lm_head.as_str());
-        for layer in &self.layers {
-            push_attention_names(&mut required, &layer.attention);
-            match &layer.kind {
-                KimiLayerWeightKindNames::Dense(mlp) => {
-                    required.push(mlp.gate_proj.as_str());
-                    required.push(mlp.up_proj.as_str());
-                    required.push(mlp.down_proj.as_str());
-                }
-                KimiLayerWeightKindNames::Moe(moe) => {
-                    required.push(moe.router.gate_weight.as_str());
-                    required.push(moe.router.e_score_correction_bias.as_str());
-                    required.push(moe.shared_experts.gate_proj.as_str());
-                    required.push(moe.shared_experts.up_proj.as_str());
-                    required.push(moe.shared_experts.down_proj.as_str());
-                    for expert in &moe.routed_experts {
-                        push_int4_projection_names(&mut required, &expert.gate_proj);
-                        push_int4_projection_names(&mut required, &expert.up_proj);
-                        push_int4_projection_names(&mut required, &expert.down_proj);
-                    }
-                }
-            }
-        }
-
-        let unique = required.iter().copied().collect::<BTreeSet<_>>();
-        ensure!(
-            unique.len() == required.len(),
-            "Kimi rank {} typed weight names contain duplicate tensors",
-            self.rank
-        );
-        ensure!(
-            required.len() == self.plan.tensor_count,
-            "Kimi rank {} typed name count {} does not match plan tensor_count {}",
-            self.rank,
-            required.len(),
-            self.plan.tensor_count
-        );
-        Ok(required)
     }
 }
 
@@ -412,95 +536,6 @@ impl KimiRoutedExpertWeightNames {
             down_proj: KimiInt4ProjectionWeightNames::from_manifest(&manifest.down_proj),
         }
     }
-}
-
-pub(super) fn validate_rank_tensor_catalog(
-    names: &KimiRankWeightNames,
-    tensor_count: usize,
-    mut validate_tensor: impl FnMut(&str, Dtype) -> Result<()>,
-) -> Result<()> {
-    let required = names.required_tensor_names()?;
-    ensure!(
-        tensor_count == required.len(),
-        "Kimi rank {} tensor catalog count {} does not match required typed tensor count {}",
-        names.rank,
-        tensor_count,
-        required.len()
-    );
-
-    validate_tensor(&names.top.token_embedding, Dtype::BF16)?;
-    validate_tensor(&names.top.final_norm, Dtype::BF16)?;
-    validate_tensor(&names.top.lm_head, Dtype::BF16)?;
-    for layer in &names.layers {
-        validate_attention_catalog(&layer.attention, &mut validate_tensor)?;
-        match &layer.kind {
-            KimiLayerWeightKindNames::Dense(mlp) => {
-                validate_tensor(&mlp.gate_proj, Dtype::BF16)?;
-                validate_tensor(&mlp.up_proj, Dtype::BF16)?;
-                validate_tensor(&mlp.down_proj, Dtype::BF16)?;
-            }
-            KimiLayerWeightKindNames::Moe(moe) => {
-                validate_tensor(&moe.router.gate_weight, Dtype::BF16)?;
-                validate_tensor(&moe.router.e_score_correction_bias, Dtype::F32)?;
-                validate_tensor(&moe.shared_experts.gate_proj, Dtype::BF16)?;
-                validate_tensor(&moe.shared_experts.up_proj, Dtype::BF16)?;
-                validate_tensor(&moe.shared_experts.down_proj, Dtype::BF16)?;
-                for expert in &moe.routed_experts {
-                    validate_int4_projection_catalog(&expert.gate_proj, &mut validate_tensor)?;
-                    validate_int4_projection_catalog(&expert.up_proj, &mut validate_tensor)?;
-                    validate_int4_projection_catalog(&expert.down_proj, &mut validate_tensor)?;
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_attention_catalog(
-    attention: &KimiAttentionWeightNames,
-    validate_tensor: &mut impl FnMut(&str, Dtype) -> Result<()>,
-) -> Result<()> {
-    validate_tensor(&attention.input_layernorm, Dtype::BF16)?;
-    validate_tensor(&attention.q_a_proj, Dtype::BF16)?;
-    validate_tensor(&attention.q_a_layernorm, Dtype::BF16)?;
-    validate_tensor(&attention.q_b_proj, Dtype::BF16)?;
-    validate_tensor(&attention.kv_a_proj_with_mqa, Dtype::BF16)?;
-    validate_tensor(&attention.kv_a_layernorm, Dtype::BF16)?;
-    validate_tensor(&attention.kv_b_proj, Dtype::BF16)?;
-    validate_tensor(&attention.o_proj, Dtype::BF16)?;
-    validate_tensor(&attention.post_attention_layernorm, Dtype::BF16)?;
-    Ok(())
-}
-
-fn validate_int4_projection_catalog(
-    projection: &KimiInt4ProjectionWeightNames,
-    validate_tensor: &mut impl FnMut(&str, Dtype) -> Result<()>,
-) -> Result<()> {
-    validate_tensor(&projection.weight_packed, Dtype::I32)?;
-    validate_tensor(&projection.weight_scale, Dtype::BF16)?;
-    validate_tensor(&projection.weight_shape, Dtype::I32)?;
-    Ok(())
-}
-
-fn push_attention_names<'a>(out: &mut Vec<&'a str>, attention: &'a KimiAttentionWeightNames) {
-    out.push(attention.input_layernorm.as_str());
-    out.push(attention.q_a_proj.as_str());
-    out.push(attention.q_a_layernorm.as_str());
-    out.push(attention.q_b_proj.as_str());
-    out.push(attention.kv_a_proj_with_mqa.as_str());
-    out.push(attention.kv_a_layernorm.as_str());
-    out.push(attention.kv_b_proj.as_str());
-    out.push(attention.o_proj.as_str());
-    out.push(attention.post_attention_layernorm.as_str());
-}
-
-fn push_int4_projection_names<'a>(
-    out: &mut Vec<&'a str>,
-    projection: &'a KimiInt4ProjectionWeightNames,
-) {
-    out.push(projection.weight_packed.as_str());
-    out.push(projection.weight_scale.as_str());
-    out.push(projection.weight_shape.as_str());
 }
 
 fn push_load_spec(

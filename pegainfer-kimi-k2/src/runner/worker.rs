@@ -1,18 +1,19 @@
 use std::{
     path::{Path, PathBuf},
-    sync::{
-        Arc, Barrier,
-        mpsc::{self, Receiver, Sender, SyncSender},
-    },
+    sync::{Arc, Barrier},
     thread,
+    time::Instant,
 };
 
 use anyhow::{Context, Result, ensure};
+use bytesize::ByteSize;
+use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use cudarc::nccl::{
     ReduceOp,
     safe::{Comm, Id},
 };
+use log::debug;
 use pegainfer_core::cuda_graph::CudaGraphState;
 #[cfg(feature = "kernel-call-trace")]
 use pegainfer_core::ops::call_trace;
@@ -109,41 +110,40 @@ pub(super) struct KimiOneTokenForwardReport {
 enum KimiRankCommand {
     LoadSlicedWeights {
         model_path: PathBuf,
-        resp: SyncSender<Result<KimiRankWeightLoadReport>>,
+        resp: Sender<Result<KimiRankWeightLoadReport>>,
     },
     InitTpComm {
         id: Id,
         world_size: usize,
-        resp: SyncSender<Result<()>>,
+        resp: Sender<Result<()>>,
     },
     EnsureDecodeArena {
         decode_batch_size: usize,
-        resp: SyncSender<Result<()>>,
+        resp: Sender<Result<()>>,
     },
     ForwardPromptNextToken {
         slot: usize,
         decode_batch_size: usize,
         input_ids: Vec<u32>,
         ep_max_seq_len: usize,
-        resp: SyncSender<Result<KimiOneTokenForwardReport>>,
+        resp: Sender<Result<KimiOneTokenForwardReport>>,
     },
     ForwardPromptLen1BatchNextTokens {
         token_ids: Vec<u32>,
         slots: Vec<usize>,
         decode_batch_size: usize,
-        resp: SyncSender<Result<Vec<KimiOneTokenForwardReport>>>,
+        resp: Sender<Result<Vec<KimiOneTokenForwardReport>>>,
     },
     ForwardDecodeBatchNextTokens {
         token_ids: Vec<u32>,
         append_positions: Vec<usize>,
         slots: Vec<usize>,
         decode_batch_size: usize,
-        resp: SyncSender<Result<Vec<KimiOneTokenForwardReport>>>,
+        resp: Sender<Result<Vec<KimiOneTokenForwardReport>>>,
     },
-    #[cfg(feature = "pplx-ep")]
     EnablePplx {
         ep_backend: pegainfer_comm::EpBackend,
-        resp: SyncSender<Result<()>>,
+        resp: Sender<Result<()>>,
     },
     Shutdown,
 }
@@ -183,8 +183,8 @@ impl KimiRankWorker {
             thread_placement.rank,
             placement.rank
         );
-        let (tx, rx) = mpsc::channel();
-        let (startup_tx, startup_rx) = mpsc::sync_channel::<Result<()>>(1);
+        let (tx, rx) = unbounded();
+        let (startup_tx, startup_rx) = bounded::<Result<()>>(1);
         let handle = thread::Builder::new()
             .name(format!("kimi-k2-rank-{}", placement.rank))
             .spawn(move || {
@@ -225,7 +225,7 @@ impl KimiRankWorker {
         &self,
         model_path: &Path,
     ) -> Result<Receiver<Result<KimiRankWeightLoadReport>>> {
-        let (resp_tx, resp_rx) = mpsc::sync_channel(1);
+        let (resp_tx, resp_rx) = bounded(1);
         self.tx
             .send(KimiRankCommand::LoadSlicedWeights {
                 model_path: model_path.to_path_buf(),
@@ -240,7 +240,7 @@ impl KimiRankWorker {
         id: Id,
         world_size: usize,
     ) -> Result<Receiver<Result<()>>> {
-        let (resp_tx, resp_rx) = mpsc::sync_channel(1);
+        let (resp_tx, resp_rx) = bounded(1);
         self.tx
             .send(KimiRankCommand::InitTpComm {
                 id,
@@ -255,7 +255,7 @@ impl KimiRankWorker {
         &self,
         decode_batch_size: usize,
     ) -> Result<Receiver<Result<()>>> {
-        let (resp_tx, resp_rx) = mpsc::sync_channel(1);
+        let (resp_tx, resp_rx) = bounded(1);
         self.tx
             .send(KimiRankCommand::EnsureDecodeArena {
                 decode_batch_size,
@@ -272,7 +272,7 @@ impl KimiRankWorker {
         decode_batch_size: usize,
         ep_max_seq_len: usize,
     ) -> Result<Receiver<Result<KimiOneTokenForwardReport>>> {
-        let (resp_tx, resp_rx) = mpsc::sync_channel(1);
+        let (resp_tx, resp_rx) = bounded(1);
         self.tx
             .send(KimiRankCommand::ForwardPromptNextToken {
                 slot,
@@ -292,7 +292,7 @@ impl KimiRankWorker {
         slots: Vec<usize>,
         decode_batch_size: usize,
     ) -> Result<Receiver<Result<Vec<KimiOneTokenForwardReport>>>> {
-        let (resp_tx, resp_rx) = mpsc::sync_channel(1);
+        let (resp_tx, resp_rx) = bounded(1);
         self.tx
             .send(KimiRankCommand::ForwardDecodeBatchNextTokens {
                 token_ids,
@@ -311,7 +311,7 @@ impl KimiRankWorker {
         slots: Vec<usize>,
         decode_batch_size: usize,
     ) -> Result<Receiver<Result<Vec<KimiOneTokenForwardReport>>>> {
-        let (resp_tx, resp_rx) = mpsc::sync_channel(1);
+        let (resp_tx, resp_rx) = bounded(1);
         self.tx
             .send(KimiRankCommand::ForwardPromptLen1BatchNextTokens {
                 token_ids,
@@ -322,13 +322,11 @@ impl KimiRankWorker {
             .map_err(|_| anyhow::anyhow!("Kimi-K2 rank worker channel closed"))?;
         Ok(resp_rx)
     }
-
-    #[cfg(feature = "pplx-ep")]
     pub(super) fn enable_pplx_async(
         &self,
         ep_backend: pegainfer_comm::EpBackend,
     ) -> Result<Receiver<Result<()>>> {
-        let (resp_tx, resp_rx) = mpsc::sync_channel(1);
+        let (resp_tx, resp_rx) = bounded(1);
         self.tx
             .send(KimiRankCommand::EnablePplx {
                 ep_backend,
@@ -370,9 +368,7 @@ struct KimiRankThreadState {
     collective_barrier: Arc<Barrier>,
     enable_cuda_graph: bool,
     loaded: Option<KimiRankLoadedWeights>,
-    #[cfg(feature = "pplx-ep")]
     ep_backend: Option<pegainfer_comm::EpBackend>,
-    #[cfg(feature = "pplx-ep")]
     moe_pplx_scratch: Option<super::moe_pplx::KimiMoePplxScratch>,
 }
 
@@ -550,17 +546,7 @@ fn bind_rank_thread(
     enable_cuda_graph: bool,
 ) -> Result<KimiRankThreadState> {
     ctx.set_current()?;
-    let decode_aux_stream = ctx.ctx.new_stream().with_context(|| {
-        format!(
-            "failed to create Kimi decode aux stream for device {}",
-            ctx.device_ordinal
-        )
-    })?;
-    let decode_aux_ctx = DeviceContext {
-        ctx: Arc::clone(&ctx.ctx),
-        stream: decode_aux_stream,
-        device_ordinal: ctx.device_ordinal,
-    };
+    let decode_aux_ctx = ctx.auxiliary_device_context("decode aux")?;
     unsafe {
         pegainfer_kernels::ffi::cublas_init();
     }
@@ -575,9 +561,7 @@ fn bind_rank_thread(
         collective_barrier,
         enable_cuda_graph,
         loaded: None,
-        #[cfg(feature = "pplx-ep")]
         ep_backend: None,
-        #[cfg(feature = "pplx-ep")]
         moe_pplx_scratch: None,
     })
 }
@@ -651,7 +635,6 @@ fn rank_worker_loop(rx: Receiver<KimiRankCommand>, mut state: KimiRankThreadStat
                 );
                 let _ = resp.send(result);
             }
-            #[cfg(feature = "pplx-ep")]
             KimiRankCommand::EnablePplx { ep_backend, resp } => {
                 let result = state.enable_pplx(ep_backend);
                 let _ = resp.send(result);
@@ -664,11 +647,8 @@ fn rank_worker_loop(rx: Receiver<KimiRankCommand>, mut state: KimiRankThreadStat
 mod cache;
 mod load;
 mod runtime;
-#[cfg(feature = "pplx-ep")]
 pub(super) use runtime::maybe_all_reduce_hidden_via_f32_in_place;
 mod state;
-
-#[cfg(feature = "pplx-ep")]
 struct PplxDecodeContext<'a> {
     ep: &'a mut pegainfer_comm::EpBackend,
     scratch: &'a mut super::moe_pplx::KimiMoePplxScratch,

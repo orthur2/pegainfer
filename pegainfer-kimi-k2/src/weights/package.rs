@@ -1,4 +1,147 @@
 use super::*;
+use super::{
+    load::dtype_element_bytes,
+    manifest::{
+        KimiAttentionWeightNames, KimiInt4ProjectionWeightNames, KimiLayerWeightKindNames,
+        KimiMoeLayerWeightNames, KimiRankWeightNames, KimiRoutedExpertWeightNames,
+    },
+};
+
+pub(crate) struct KimiGpuRawTensor {
+    pub name: String,
+    pub dtype: Dtype,
+    pub shape: Vec<usize>,
+    pub bytes: usize,
+    pub data: CudaSlice<u8>,
+}
+
+pub(crate) struct KimiRankGpuWeights {
+    pub rank: usize,
+    pub tensors: BTreeMap<String, KimiGpuRawTensor>,
+    pub total_bytes: usize,
+}
+
+pub(crate) struct KimiRouterGpuWeights<'a> {
+    pub gate_weight: &'a KimiGpuRawTensor,
+    pub e_score_correction_bias: &'a KimiGpuRawTensor,
+}
+
+pub(crate) struct KimiRouterDeviceWeights {
+    pub gate_weight: GpuWeight<KIMI_K2_ROUTED_EXPERTS, KIMI_K2_HIDDEN>,
+    pub e_score_correction_bias: CudaSlice<f32>,
+}
+
+struct KimiInt4ProjectionGpuWeights<'a> {
+    pub weight_packed: &'a KimiGpuRawTensor,
+    pub weight_scale: &'a KimiGpuRawTensor,
+    pub weight_shape: &'a KimiGpuRawTensor,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum KimiInt4ProjectionRole {
+    Gate,
+    Up,
+    Down,
+}
+
+impl KimiInt4ProjectionRole {
+    const fn dims(self) -> (usize, usize) {
+        match self {
+            Self::Gate | Self::Up => (KIMI_K2_EXPERT_INTERMEDIATE, KIMI_K2_HIDDEN),
+            Self::Down => (KIMI_K2_HIDDEN, KIMI_K2_EXPERT_INTERMEDIATE),
+        }
+    }
+
+    const fn kernel_role(self) -> KimiInt4ExpertRole {
+        match self {
+            Self::Gate => KimiInt4ExpertRole::W1Gate,
+            Self::Up => KimiInt4ExpertRole::W3Up,
+            Self::Down => KimiInt4ExpertRole::W2Down,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KimiExpertMajorProjectionPlan {
+    pub local_experts: usize,
+    pub out_dim: usize,
+    pub in_dim: usize,
+    pub packed_bytes: usize,
+    pub scale_bytes: usize,
+}
+
+pub(crate) struct KimiExpertMajorProjectionMarlinBuffers {
+    pub role: KimiInt4ProjectionRole,
+    pub plan: KimiExpertMajorProjectionPlan,
+    pub manifest: KimiInt4WeightManifest,
+    pub weight_packed_marlin_uint4b8: CudaSlice<u8>,
+    pub weight_scale_marlin_permuted: CudaSlice<bf16>,
+}
+
+impl KimiExpertMajorProjectionMarlinBuffers {
+    fn as_marlin_weight(&self) -> KimiMarlinInt4Weight<'_> {
+        KimiMarlinInt4Weight {
+            manifest: self.manifest,
+            weight_packed_uint4b8: &self.weight_packed_marlin_uint4b8,
+            weight_scale_permuted: &self.weight_scale_marlin_permuted,
+        }
+    }
+
+    fn package_bytes(&self) -> usize {
+        self.weight_packed_marlin_uint4b8.len()
+            + self.weight_scale_marlin_permuted.len() * std::mem::size_of::<bf16>()
+    }
+}
+
+pub(crate) struct KimiExpertMajorW13MarlinBuffers {
+    pub local_experts: usize,
+    pub in_dim: usize,
+    pub intermediate_dim: usize,
+    pub group_size: usize,
+    pub weight_packed_marlin_uint4b8: CudaSlice<u8>,
+    pub weight_scale_marlin_permuted: CudaSlice<bf16>,
+}
+
+impl KimiExpertMajorW13MarlinBuffers {
+    fn as_marlin_weight(&self) -> KimiMarlinFusedW13Int4Weight<'_> {
+        KimiMarlinFusedW13Int4Weight {
+            local_experts: self.local_experts,
+            in_dim: self.in_dim,
+            intermediate_dim: self.intermediate_dim,
+            group_size: self.group_size,
+            weight_packed_uint4b8: &self.weight_packed_marlin_uint4b8,
+            weight_scale_permuted: &self.weight_scale_marlin_permuted,
+        }
+    }
+
+    fn package_bytes(&self) -> usize {
+        self.weight_packed_marlin_uint4b8.len()
+            + self.weight_scale_marlin_permuted.len() * std::mem::size_of::<bf16>()
+    }
+}
+
+pub(crate) struct KimiMoeLayerExpertMarlinWeights {
+    pub layer_idx: usize,
+    pub w13: KimiExpertMajorW13MarlinBuffers,
+    pub down: KimiExpertMajorProjectionMarlinBuffers,
+    pub total_bytes: usize,
+}
+
+pub(crate) struct KimiRankExpertMarlinWeights {
+    pub rank: usize,
+    pub local_expert_range: Range<usize>,
+    pub layers: Vec<KimiMoeLayerExpertMarlinWeights>,
+    pub total_bytes: usize,
+}
+
+impl KimiMoeLayerExpertMarlinWeights {
+    pub(crate) fn as_marlin_weights(&self) -> KimiMarlinInt4ExpertWeights<'_> {
+        KimiMarlinInt4ExpertWeights {
+            w13: self.w13.as_marlin_weight(),
+            w2_down: self.down.as_marlin_weight(),
+        }
+    }
+}
 
 impl KimiGpuRawTensor {
     pub(crate) fn copy_bf16_matrix(
@@ -45,20 +188,34 @@ impl KimiGpuRawTensor {
 }
 
 impl KimiRankGpuWeights {
-    /// Validate that every planned tensor is present on the GPU with the
-    /// expected dtype and that the loaded count matches the plan. The check is
-    /// exhaustive (`validate_rank_tensor_catalog` walks all top/attention/MoE
-    /// names with their dtypes), so no typed view needs to be materialized.
-    pub(crate) fn validate_typed_view(&self, names: &KimiRankWeightNames) -> Result<()> {
+    pub(crate) fn validate_non_expert_typed_view(&self, names: &KimiRankWeightNames) -> Result<()> {
         ensure!(
             self.rank == names.rank,
             "Kimi GPU rank {} does not match typed names rank {}",
             self.rank,
             names.rank
         );
-        validate_rank_tensor_catalog(names, self.tensors.len(), |name, dtype| {
-            self.expect_tensor(name, dtype).map(|_| ())
-        })
+        self.expect_tensor(&names.top.token_embedding, Dtype::BF16)?;
+        self.expect_tensor(&names.top.final_norm, Dtype::BF16)?;
+        self.expect_tensor(&names.top.lm_head, Dtype::BF16)?;
+        for layer in &names.layers {
+            validate_attention_resident_tensors(self, &layer.attention)?;
+            match &layer.kind {
+                KimiLayerWeightKindNames::Dense(mlp) => {
+                    self.expect_tensor(&mlp.gate_proj, Dtype::BF16)?;
+                    self.expect_tensor(&mlp.up_proj, Dtype::BF16)?;
+                    self.expect_tensor(&mlp.down_proj, Dtype::BF16)?;
+                }
+                KimiLayerWeightKindNames::Moe(moe) => {
+                    self.expect_tensor(&moe.router.gate_weight, Dtype::BF16)?;
+                    self.expect_tensor(&moe.router.e_score_correction_bias, Dtype::F32)?;
+                    self.expect_tensor(&moe.shared_experts.gate_proj, Dtype::BF16)?;
+                    self.expect_tensor(&moe.shared_experts.up_proj, Dtype::BF16)?;
+                    self.expect_tensor(&moe.shared_experts.down_proj, Dtype::BF16)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn int4_projection_view<'a>(
@@ -72,11 +229,13 @@ impl KimiRankGpuWeights {
         })
     }
 
-    pub(crate) fn pack_rank_expert_marlin_weights(
+    pub(crate) fn pack_loaded_expert_marlin_layers(
         &mut self,
         ctx: &KimiRankGpuContext,
         names: &KimiRankWeightNames,
-    ) -> Result<KimiRankExpertMarlinWeights> {
+        packed_layers: &mut BTreeSet<usize>,
+        out: &mut Vec<KimiMoeLayerExpertMarlinWeights>,
+    ) -> Result<()> {
         ensure!(
             self.rank == names.rank,
             "Kimi GPU rank {} does not match typed names rank {}",
@@ -84,73 +243,21 @@ impl KimiRankGpuWeights {
             names.rank
         );
         ctx.set_current()?;
-        let mut layers = Vec::with_capacity(KIMI_K2_MOE_LAYERS);
         for layer in &names.layers {
             let KimiLayerWeightKindNames::Moe(moe) = &layer.kind else {
                 continue;
             };
-            validate_local_expert_name_order(
-                names.rank,
-                layer.layer_idx,
-                names.plan.local_expert_range.clone(),
-                &moe.routed_experts,
-            )?;
-
-            let gate = self.pack_projection_marlin_buffers_from_names(
-                ctx,
-                names.plan.ep_rank,
-                KimiInt4ProjectionRole::Gate,
-                moe.routed_experts
-                    .iter()
-                    .map(|expert| &expert.gate_proj)
-                    .collect::<Vec<_>>()
-                    .as_slice(),
-            )?;
-            let up = self.pack_projection_marlin_buffers_from_names(
-                ctx,
-                names.plan.ep_rank,
-                KimiInt4ProjectionRole::Up,
-                moe.routed_experts
-                    .iter()
-                    .map(|expert| &expert.up_proj)
-                    .collect::<Vec<_>>()
-                    .as_slice(),
-            )?;
-            let down = self.pack_projection_marlin_buffers_from_names(
-                ctx,
-                names.plan.ep_rank,
-                KimiInt4ProjectionRole::Down,
-                moe.routed_experts
-                    .iter()
-                    .map(|expert| &expert.down_proj)
-                    .collect::<Vec<_>>()
-                    .as_slice(),
-            )?;
-            let w13 = fuse_expert_major_w13_marlin_buffers(ctx, &gate, &up)?;
-            let total_bytes = w13.package_bytes() + down.package_bytes();
-            let weights = KimiMoeLayerExpertMarlinWeights {
-                layer_idx: layer.layer_idx,
-                w13,
-                down,
-                total_bytes,
-            };
+            if packed_layers.contains(&layer.layer_idx) || !self.has_all_routed_expert_raw(moe) {
+                continue;
+            }
+            let weights =
+                self.pack_moe_layer_expert_marlin_weights(ctx, names, layer.layer_idx, moe)?;
             weights.as_marlin_weights().validate()?;
-            layers.push(weights);
             self.remove_packaged_routed_expert_raw_tensors(&[moe])?;
+            packed_layers.insert(layer.layer_idx);
+            out.push(weights);
         }
-        ensure!(
-            layers.len() == KIMI_K2_MOE_LAYERS,
-            "Kimi rank {} expected {KIMI_K2_MOE_LAYERS} MoE Marlin weight layers, got {}",
-            self.rank,
-            layers.len()
-        );
-        let total_bytes = layers.iter().map(|layer| layer.total_bytes).sum();
-        Ok(KimiRankExpertMarlinWeights {
-            rank: self.rank,
-            local_expert_range: names.plan.local_expert_range.clone(),
-            layers,
-            total_bytes,
-        })
+        Ok(())
     }
 
     fn pack_projection_marlin_buffers_from_names(
@@ -165,6 +272,68 @@ impl KimiRankGpuWeights {
             .map(|projection| self.int4_projection_view(projection))
             .collect::<Result<Vec<_>>>()?;
         pack_expert_major_projection_marlin_buffers(ctx, ep_rank, role, projections.iter())
+    }
+
+    fn pack_moe_layer_expert_marlin_weights(
+        &self,
+        ctx: &KimiRankGpuContext,
+        names: &KimiRankWeightNames,
+        layer_idx: usize,
+        moe: &KimiMoeLayerWeightNames,
+    ) -> Result<KimiMoeLayerExpertMarlinWeights> {
+        validate_local_expert_name_order(
+            names.rank,
+            layer_idx,
+            names.plan.local_expert_range.clone(),
+            &moe.routed_experts,
+        )?;
+
+        let gate = self.pack_projection_marlin_buffers_from_names(
+            ctx,
+            names.plan.ep_rank,
+            KimiInt4ProjectionRole::Gate,
+            moe.routed_experts
+                .iter()
+                .map(|expert| &expert.gate_proj)
+                .collect::<Vec<_>>()
+                .as_slice(),
+        )?;
+        let up = self.pack_projection_marlin_buffers_from_names(
+            ctx,
+            names.plan.ep_rank,
+            KimiInt4ProjectionRole::Up,
+            moe.routed_experts
+                .iter()
+                .map(|expert| &expert.up_proj)
+                .collect::<Vec<_>>()
+                .as_slice(),
+        )?;
+        let down = self.pack_projection_marlin_buffers_from_names(
+            ctx,
+            names.plan.ep_rank,
+            KimiInt4ProjectionRole::Down,
+            moe.routed_experts
+                .iter()
+                .map(|expert| &expert.down_proj)
+                .collect::<Vec<_>>()
+                .as_slice(),
+        )?;
+        let w13 = fuse_expert_major_w13_marlin_buffers(ctx, &gate, &up)?;
+        let total_bytes = w13.package_bytes() + down.package_bytes();
+        Ok(KimiMoeLayerExpertMarlinWeights {
+            layer_idx,
+            w13,
+            down,
+            total_bytes,
+        })
+    }
+
+    fn has_all_routed_expert_raw(&self, moe: &KimiMoeLayerWeightNames) -> bool {
+        moe.routed_experts.iter().all(|expert| {
+            has_int4_projection_raw(&self.tensors, &expert.gate_proj)
+                && has_int4_projection_raw(&self.tensors, &expert.up_proj)
+                && has_int4_projection_raw(&self.tensors, &expert.down_proj)
+        })
     }
 
     fn remove_packaged_routed_expert_raw_tensors(
@@ -219,6 +388,31 @@ impl KimiRankGpuWeights {
         );
         Ok(tensor)
     }
+}
+
+fn validate_attention_resident_tensors(
+    weights: &KimiRankGpuWeights,
+    attention: &KimiAttentionWeightNames,
+) -> Result<()> {
+    weights.expect_tensor(&attention.input_layernorm, Dtype::BF16)?;
+    weights.expect_tensor(&attention.q_a_proj, Dtype::BF16)?;
+    weights.expect_tensor(&attention.q_a_layernorm, Dtype::BF16)?;
+    weights.expect_tensor(&attention.q_b_proj, Dtype::BF16)?;
+    weights.expect_tensor(&attention.kv_a_proj_with_mqa, Dtype::BF16)?;
+    weights.expect_tensor(&attention.kv_a_layernorm, Dtype::BF16)?;
+    weights.expect_tensor(&attention.kv_b_proj, Dtype::BF16)?;
+    weights.expect_tensor(&attention.o_proj, Dtype::BF16)?;
+    weights.expect_tensor(&attention.post_attention_layernorm, Dtype::BF16)?;
+    Ok(())
+}
+
+fn has_int4_projection_raw(
+    tensors: &BTreeMap<String, KimiGpuRawTensor>,
+    projection: &KimiInt4ProjectionWeightNames,
+) -> bool {
+    tensors.contains_key(&projection.weight_packed)
+        && tensors.contains_key(&projection.weight_scale)
+        && tensors.contains_key(&projection.weight_shape)
 }
 
 impl KimiRouterGpuWeights<'_> {
@@ -325,16 +519,16 @@ fn pack_expert_major_projection_marlin_buffers<'a>(
     );
 
     let mut weight_packed_offset_binary = ctx
-        .stream
+        .stream()
         .alloc_zeros::<u8>(manifest.packed_shape.elements())?;
     let mut weight_packed_marlin_uint4b8 = ctx
-        .stream
+        .stream()
         .alloc_zeros::<u8>(manifest.packed_shape.elements())?;
     let mut weight_scale_checkpoint = ctx
-        .stream
+        .stream()
         .alloc_zeros::<bf16>(manifest.scale_shape.elements())?;
     let mut weight_scale_marlin_permuted = ctx
-        .stream
+        .stream()
         .alloc_zeros::<bf16>(manifest.scale_shape.elements())?;
 
     copy_projection_component_to_contiguous(
@@ -396,10 +590,10 @@ fn fuse_expert_major_w13_marlin_buffers(
         gate.plan,
         up.plan
     );
-    let mut weight_packed_marlin_uint4b8 = ctx.stream.alloc_zeros::<u8>(
+    let mut weight_packed_marlin_uint4b8 = ctx.stream().alloc_zeros::<u8>(
         gate.weight_packed_marlin_uint4b8.len() + up.weight_packed_marlin_uint4b8.len(),
     )?;
-    let mut weight_scale_marlin_permuted = ctx.stream.alloc_zeros::<bf16>(
+    let mut weight_scale_marlin_permuted = ctx.stream().alloc_zeros::<bf16>(
         gate.weight_scale_marlin_permuted.len() + up.weight_scale_marlin_permuted.len(),
     )?;
 
@@ -443,7 +637,7 @@ fn copy_projection_component_to_contiguous<'a>(
             end <= expected_bytes,
             "Kimi expert-major {component} copy would exceed destination: end {end}, expected {expected_bytes}"
         );
-        ctx.stream
+        ctx.stream()
             .memcpy_dtod(
                 &tensor.data.slice(0..tensor.bytes),
                 &mut dst.slice_mut(offset..end),
@@ -475,12 +669,14 @@ fn copy_raw_tensor_to_typed<T: DeviceRepr + ValidAsZeroBits>(
         tensor.bytes,
         element_bytes
     );
-    let mut dst = ctx.stream.alloc_zeros::<T>(tensor.bytes / element_bytes)?;
+    let mut dst = ctx
+        .stream()
+        .alloc_zeros::<T>(tensor.bytes / element_bytes)?;
     {
-        let (src_ptr, _src_guard) = tensor.data.device_ptr(&ctx.stream);
-        let (dst_ptr, _dst_guard) = dst.device_ptr_mut(&ctx.stream);
+        let (src_ptr, _src_guard) = tensor.data.device_ptr(ctx.stream());
+        let (dst_ptr, _dst_guard) = dst.device_ptr_mut(ctx.stream());
         unsafe {
-            cuda_result::memcpy_dtod_async(dst_ptr, src_ptr, tensor.bytes, ctx.stream.cu_stream())
+            cuda_result::memcpy_dtod_async(dst_ptr, src_ptr, tensor.bytes, ctx.stream().cu_stream())
         }
         .with_context(|| {
             format!(
@@ -511,8 +707,8 @@ fn copy_projection_component_to_typed_contiguous<'a, T: DeviceRepr>(
             end <= expected_bytes,
             "Kimi expert-major {component} copy would exceed destination: end {end}, expected {expected_bytes}"
         );
-        let (src_ptr, _src_guard) = tensor.data.device_ptr(&ctx.stream);
-        let (dst_ptr, _dst_guard) = dst.device_ptr_mut(&ctx.stream);
+        let (src_ptr, _src_guard) = tensor.data.device_ptr(ctx.stream());
+        let (dst_ptr, _dst_guard) = dst.device_ptr_mut(ctx.stream());
         // SAFETY: this is a byte-preserving D2D copy from the raw safetensors
         // GPU payload into a typed buffer with the same total byte count. The
         // dtype and shape were validated immediately before allocation.
@@ -521,7 +717,7 @@ fn copy_projection_component_to_typed_contiguous<'a, T: DeviceRepr>(
                 dst_ptr + offset as u64,
                 src_ptr,
                 tensor.bytes,
-                ctx.stream.cu_stream(),
+                ctx.stream().cu_stream(),
             )
         }
         .with_context(|| {
