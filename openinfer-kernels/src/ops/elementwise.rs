@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
 use crate::ffi;
-use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
+use crate::tensor::{DeviceContext, DeviceVec, HiddenStates, HiddenStatesRef};
 
 /// Batched element-wise add: out = a + b (same shape HiddenStates)
 pub fn add_batch(ctx: &DeviceContext, a: &HiddenStates, b: &HiddenStates) -> Result<HiddenStates> {
@@ -478,9 +478,18 @@ pub fn extract_vec(
     batch: &HiddenStates,
     token_idx: usize,
 ) -> Result<DeviceVec> {
+    extract_vec_ref(ctx, batch.as_ref(), token_idx)
+}
+
+/// Extract a single token's vector from a borrowed HiddenStates batch.
+pub fn extract_vec_ref(
+    ctx: &DeviceContext,
+    batch: HiddenStatesRef<'_>,
+    token_idx: usize,
+) -> Result<DeviceVec> {
     let len = batch.hidden_dim;
     let mut out = DeviceVec::zeros(ctx, len)?;
-    extract_vec_into(ctx, batch, token_idx, &mut out)?;
+    extract_vec_ref_into(ctx, batch, token_idx, &mut out)?;
     Ok(out)
 }
 
@@ -491,9 +500,24 @@ pub fn extract_vec_into(
     token_idx: usize,
     out: &mut DeviceVec,
 ) -> Result<()> {
-    let offset = token_idx * batch.hidden_dim;
+    extract_vec_ref_into(ctx, batch.as_ref(), token_idx, out)
+}
+
+/// Copy one column from a borrowed `batch` into a pre-allocated `out`.
+pub fn extract_vec_ref_into(
+    ctx: &DeviceContext,
+    batch: HiddenStatesRef<'_>,
+    token_idx: usize,
+    out: &mut DeviceVec,
+) -> Result<()> {
     let len = batch.hidden_dim;
     anyhow::ensure!(out.len == len, "extract_vec_into len mismatch");
+    anyhow::ensure!(
+        token_idx < batch.seq_len,
+        "extract_vec_into token index {token_idx} out of bounds for seq_len {}",
+        batch.seq_len
+    );
+    let offset = token_idx * batch.hidden_dim;
     let src_view = batch.data.slice(offset..offset + len);
     ctx.stream
         .memcpy_dtod(&src_view, &mut out.data)
@@ -585,6 +609,21 @@ mod tests {
                 "fused/split silu_mul mismatch at index {idx}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn extract_vec_ref_rejects_out_of_bounds_token() -> Result<()> {
+        let ctx = DeviceContext::new()?;
+        let hidden = hidden_from_host(&ctx, &[bf16::from_f32(1.0), bf16::from_f32(2.0)], 2, 1)?;
+        let mut out = DeviceVec::zeros(&ctx, 2)?;
+
+        let err = extract_vec_ref_into(&ctx, hidden.as_ref(), 1, &mut out).unwrap_err();
+
+        assert!(
+            err.to_string().contains("out of bounds"),
+            "unexpected error: {err}"
+        );
         Ok(())
     }
 }

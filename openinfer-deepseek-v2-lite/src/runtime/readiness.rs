@@ -9,6 +9,9 @@ use super::{
     },
 };
 
+#[cfg(test)]
+mod tests;
+
 impl DeepSeekV2LiteEp2Generator {
     pub fn decode_graph_readiness_report(
         &self,
@@ -90,16 +93,6 @@ fn decode_graph_blockers(backend: EpBackendKind) -> Vec<DecodeGraphBlocker> {
             },
         ],
         EpBackendKind::Nccl => vec![
-            DecodeGraphBlocker {
-                id: "nccl_dense_exchange_allocates_per_call",
-                source: "nccl_backend.rs::dense_all_reduce_rank0_hidden_to_rank1",
-                reason: "rank0/rank1 receive and zero-send buffers are allocated inside each dense exchange",
-            },
-            DecodeGraphBlocker {
-                id: "nccl_dense_exchange_syncs_rank_streams",
-                source: "nccl_backend.rs::dense_all_reduce_rank0_hidden_to_rank1",
-                reason: "both rank streams are synchronized after every dense exchange",
-            },
             DecodeGraphBlocker {
                 id: "nccl_route_iteration_on_host",
                 source: "runtime/moe.rs::moe_forward_nccl",
