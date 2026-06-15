@@ -12,6 +12,7 @@ default = []
 deepseek-v2-lite = []
 
 [dependencies]
+log = { workspace = true }
 anyhow = { workspace = true }
 cudarc = { workspace = true }
 half = { workspace = true }
