@@ -79,7 +79,7 @@ impl DeepSeekV2LiteEp2Generator {
 
         let rank0_started = Instant::now();
         info!(
-            "start load DeepSeek-V2-Lite EP rank 0: device={}, tensors={}",
+            "start initialize DeepSeek-V2-Lite EP rank 0 model: device={}, tensors={}",
             options.device_ordinals[0],
             rank0_plan.tensor_count()
         );
@@ -91,13 +91,13 @@ impl DeepSeekV2LiteEp2Generator {
         )
         .context("load DeepSeek-V2-Lite EP rank 0")?;
         info!(
-            "load DeepSeek-V2-Lite EP rank 0 cost {:.2}s",
+            "initialize DeepSeek-V2-Lite EP rank 0 model cost {:.2}s",
             rank0_started.elapsed().as_secs_f64()
         );
 
         let rank1_started = Instant::now();
         info!(
-            "start load DeepSeek-V2-Lite EP rank 1: device={}, tensors={}",
+            "start initialize DeepSeek-V2-Lite EP rank 1 model: device={}, tensors={}",
             options.device_ordinals[1],
             rank1_plan.tensor_count()
         );
@@ -109,7 +109,7 @@ impl DeepSeekV2LiteEp2Generator {
         )
         .context("load DeepSeek-V2-Lite EP rank 1")?;
         info!(
-            "load DeepSeek-V2-Lite EP rank 1 cost {:.2}s",
+            "initialize DeepSeek-V2-Lite EP rank 1 model cost {:.2}s",
             rank1_started.elapsed().as_secs_f64()
         );
 
