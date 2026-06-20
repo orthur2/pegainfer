@@ -1,6 +1,6 @@
 # DeepSeek-V2-Lite Status And Benchmark Ledger
 
-> **TL;DR:** DeepSeek-V2-Lite is a feature-gated EP2 correctness and attribution target. The original `Hello` / 16 greedy gate is now widened through a committed small case set for HF / host-staged / NCCL comparison; NCCL decode combine and dense exchange use reusable device scratch, eager NCCL keeps the #277 host route plan as the correctness oracle, and #278 adds a probe-only fixed-topology NCCL decode step that captured, instantiated, replayed, and verified under CUDA Graph on the retained batch-1 shape. Current direct batch, OpenInfer HTTP pressure, and vLLM TP2 / TP2+EP2 data from a documented validation environment remain diagnostic and do not claim production serving parity.
+> **TL;DR:** DeepSeek-V2-Lite is a feature-gated EP2 correctness and attribution target. HF / host-staged / NCCL exactness is guarded by a committed case set. #278 adds probe-only CUDA Graph evidence for one NCCL batch-1 decode step: capture, instantiate, replay, and token verification all pass. Direct batch, HTTP pressure, and vLLM rows remain diagnostic and do not claim production serving parity.
 
 Last touched: 2026-06
 
@@ -18,7 +18,7 @@ Last touched: 2026-06
 | Device-resident NCCL combine | Available | Issue #275 keeps NCCL combine contributions/results on reusable f32 device scratch and preserves the HF / host-staged / NCCL exact gate on 2x RTX 5090. |
 | Device-resident NCCL dense exchange | Available | Issue #276 reuses backend-owned bf16 dense-exchange scratch, clears rank1 zero-send every exchange, removes dense-exchange stream sync from the backend call, and preserves HF / host-staged / NCCL exactness on 2x RTX 5090. |
 | NCCL route-plan replay | Available | Issue #277 builds a token-major host route plan once after top-k routing, replays that plan for NCCL expert launches and device contribution accumulation, keeps route counters visible, and preserves HF / host-staged / NCCL exactness on 2x RTX 5090. This remains the eager NCCL oracle path. |
-| NCCL CUDA Graph readiness | Covered-shape diagnostic | The attribution binary emits schema-2 `cuda_graph_readiness`, including the old optional NCCL all-reduce smoke and a fail-closed `full_decode_graph_probe`. Issue #278 adds probe-only fixed-topology MoE, device routing, device attention/norm/sampling, graph-safe cuBLAS activation, and paired-rank graph replay. The 2026-06-20 2x RTX 5090 probe reports `captured=true`, `instantiated=true`, `replayed=true`, `verified=true`, `replay_count=8`, `verified_replay_count=8`, and `full_decode_capture_ready=true` for the retained batch-1 NCCL decode step. |
+| NCCL CUDA Graph readiness | Covered-shape diagnostic | Schema-2 `cuda_graph_readiness` now includes a fail-closed `full_decode_graph_probe`. The 2026-06-20 run reports capture, instantiate, replay, and verification success with `8/8` verified replays for the retained batch-1 NCCL decode step. |
 | Production continuous batching | Not available | The direct diagnostic batch path is not mixed-request HTTP serving. |
 | vLLM production parity | Not claimed | The vLLM TP2 / TP2+EP2 snapshot below is a runnable comparison from a documented validation environment, not serving parity or a stock-install claim. |
 
@@ -135,7 +135,7 @@ Do not claim:
 
 Issue #205 records the model roadmap. Maintainer feedback there calls out NCCL plus CUDA Graph as the likely best decode direction, with host staging possibly deprecated later. Treat that as a future direction, not as current evidence.
 
-The current graph-readiness diagnostic is intentionally fail-closed: `full_decode_capture_ready=true` for NCCL only when `full_decode_graph_probe` captures, instantiates, replays, and verifies the covered shape. Issue #275 removed the old NCCL combine H2D/D2H/allocation/sync blockers, issue #276 removed the dense-exchange allocation/sync blockers, issue #277 introduced the eager host route-plan oracle, and issue #278 adds a probe-only fixed-topology NCCL decode step that avoids host-built route-plan replay inside the graph. The retained 2026-06-20 2x RTX 5090 run verifies that covered decode step with `failure_stage=none`, no blocker IDs, and 8 verified replays of the same captured graph. The optional f32 NCCL graph smoke remains a separate collective-only diagnostic and is not full decode graph coverage. HF, host-staged, and NCCL remain token/text exact for the committed case set.
+The graph-readiness diagnostic is fail-closed. `full_decode_capture_ready=true` is valid only when `full_decode_graph_probe` captures, instantiates, replays, and verifies the covered shape. The optional f32 NCCL graph smoke remains collective-only evidence. HF, host-staged, and NCCL still need token/text exactness for the committed case set.
 
 The next implementation should be chosen from measured evidence:
 
@@ -148,11 +148,9 @@ The next implementation should be chosen from measured evidence:
    - keep HF / host-staged / NCCL exact before and after;
    - keep host-staged as the correctness baseline while it exists;
    - preserve attribution before and after the change;
-   - keep the existing eager NCCL route-plan path as the serving oracle until the graph path is widened and measured;
-   - do not widen the claim beyond batch `1`, `prompt="Hello"`, `output_len=16` unless new graph probe evidence covers that shape;
-   - treat any future `failure_stage` from `--full-decode-graph-probe` as fail-closed evidence, not a runtime performance result;
-   - avoid broad generic EP or multi-node work;
-   - judge issue #170 by whether it reduces NCCL decode overhead without weakening the graph and exactness gates.
+   - keep the eager NCCL route-plan path as the serving oracle until the graph path is widened and measured;
+   - keep the graph claim at batch `1`, `prompt="Hello"`, `output_len=16` until another probe covers more;
+   - treat any future `failure_stage` as fail-closed evidence.
 
 3. Keep a fair serving benchmark contract around future performance work.
    - OpenInfer host-staged.

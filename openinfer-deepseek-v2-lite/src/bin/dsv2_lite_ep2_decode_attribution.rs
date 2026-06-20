@@ -69,7 +69,7 @@ fn main() -> Result<()> {
         },
     )?;
     trace_stage("generator loaded");
-    let report = if cli.batch_size == 1 {
+    let (report, probe_status, probe_ready) = if cli.batch_size == 1 {
         trace_stage("run batch=1 attribution oracle");
         let (result, attribution) =
             generator.generate_greedy_with_attribution(&prompt_tokens, OUTPUT_LEN, false)?;
@@ -84,13 +84,16 @@ fn main() -> Result<()> {
             OUTPUT_LEN,
         )?;
         trace_stage("graph readiness report complete");
-        single_report(
+        let probe_status = graph_readiness.full_decode_graph_probe_status();
+        let probe_ready = graph_readiness.full_decode_capture_ready();
+        let report = single_report(
             &tokenizer,
             &prompt_tokens,
             &result,
             &attribution,
             &graph_readiness,
-        )?
+        )?;
+        (report, probe_status, probe_ready)
     } else {
         trace_stage("run batch attribution oracle");
         let (result, attribution) = generator.generate_greedy_batch_same_prompt_with_attribution(
@@ -110,18 +113,21 @@ fn main() -> Result<()> {
             OUTPUT_LEN,
         )?;
         trace_stage("graph readiness report complete");
-        batch_report(
+        let probe_status = graph_readiness.full_decode_graph_probe_status();
+        let probe_ready = graph_readiness.full_decode_capture_ready();
+        let report = batch_report(
             &tokenizer,
             &prompt_tokens,
             &result,
             &attribution,
             &graph_readiness,
-        )?
+        )?;
+        (report, probe_status, probe_ready)
     };
 
     let text = serde_json::to_string_pretty(&report)?;
-    if let Some(out) = cli.out {
-        let path = resolve_workspace_path(out);
+    let output_path = cli.out.clone().map(resolve_workspace_path);
+    if let Some(path) = &output_path {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
         }
@@ -130,7 +136,34 @@ fn main() -> Result<()> {
         eprintln!("wrote {}", path.display());
     }
     println!("{text}");
+    ensure_full_decode_graph_probe_succeeded(
+        cli.full_decode_graph_probe,
+        probe_ready,
+        probe_status,
+        output_path.as_deref(),
+    )?;
     Ok(())
+}
+
+fn ensure_full_decode_graph_probe_succeeded(
+    requested: bool,
+    ready: bool,
+    status: &str,
+    output_path: Option<&Path>,
+) -> Result<()> {
+    ensure!(
+        !requested || ready,
+        "DeepSeek-V2-Lite --full-decode-graph-probe failed with status={status}; diagnostic JSON was {}",
+        graph_probe_diagnostic_target(output_path)
+    );
+    Ok(())
+}
+
+fn graph_probe_diagnostic_target(output_path: Option<&Path>) -> String {
+    output_path.map_or_else(
+        || "printed to stdout".to_string(),
+        |path| format!("written to {} and printed to stdout", path.display()),
+    )
 }
 
 fn trace_stage(stage: &str) {
@@ -605,4 +638,42 @@ fn workspace_root() -> PathBuf {
         .parent()
         .expect("model crate must live under the workspace root")
         .to_path_buf()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_decode_graph_probe_gate_allows_not_requested() {
+        ensure_full_decode_graph_probe_succeeded(
+            false,
+            false,
+            "full_decode_probe_not_requested",
+            None,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn full_decode_graph_probe_gate_allows_ready_probe() {
+        ensure_full_decode_graph_probe_succeeded(true, true, "captured_replayed_verified", None)
+            .unwrap();
+    }
+
+    #[test]
+    fn full_decode_graph_probe_gate_fails_requested_unready_probe() {
+        let err = ensure_full_decode_graph_probe_succeeded(
+            true,
+            false,
+            "blocked_preflight",
+            Some(Path::new("target/probe.json")),
+        )
+        .unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("--full-decode-graph-probe failed"));
+        assert!(message.contains("status=blocked_preflight"));
+        assert!(message.contains("target/probe.json"));
+    }
 }

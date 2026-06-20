@@ -456,8 +456,8 @@ impl NaiveNcclEp2Backend {
         topk: usize,
     ) -> Result<()> {
         let mut scratch = self.combine_scratch()?;
-        // Future graph capture must pre-size this scratch and turn this into a
-        // shape assertion; `ensure_shape` may allocate when the shape grows.
+        // Graph capture relies on `prepare_graph_shape` sizing this scratch
+        // before the capture window; this call is only a shape assertion.
         scratch.ensure_shape(expert_output.hidden_dim, expert_output.seq_len)?;
         activate(ctx)?;
         dsv2_lite_accumulate_fixed_expert_into(
