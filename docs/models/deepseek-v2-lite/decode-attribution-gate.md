@@ -1,6 +1,6 @@
 # DeepSeek-V2-Lite EP2 Decode Attribution Gate
 
-> **TL;DR:** DeepSeek-V2-Lite has a narrow EP2 decode attribution report for the retained diagnostic shape: `prompt="Hello"`, `output_len=16`, `batch-size=1/4/8`, host-staged backend, and NCCL backend. The wider HF accuracy gate now covers more cases, while this report stays focused on CPU-side attribution, selected CUDA event timing, optional NVTX ranges, route/transfer counts, and a fail-closed CUDA Graph readiness section. It is evidence for the next bottleneck decision, not a throughput or production EP claim.
+> **TL;DR:** DeepSeek-V2-Lite has a narrow EP2 decode attribution report for the retained diagnostic shape: `prompt="Hello"`, `output_len=16`, `batch-size=1/4/8`, host-staged backend, and NCCL backend. The wider HF accuracy gate now covers more cases, while this report stays focused on CPU-side attribution, selected CUDA event timing, optional NVTX ranges, route/transfer counts, and a fail-closed CUDA Graph readiness section with an explicit full-decode probe. Issue #278 now has covered-shape NCCL decode-step capture, instantiate, replay, and token verification evidence; this is still not a throughput or production EP claim.
 >
 > **Status:** Passing for the covered EP2 `Hello` / 16-token host-staged and NCCL attribution gate. The batch attribution mode is diagnostic and uses the same-prompt, fixed-length shape as the direct benchmark path.
 
@@ -35,11 +35,11 @@ Out of scope:
 - `by_section`, `by_op`, and `by_call_site` rollups in the same vocabulary family as the Qwen3 model report;
 - `coverage` rows that distinguish CPU section timing, selected GPU event timing, optional NVTX ranges, and unclaimed throughput;
 - `ep` counters for host-staged dispatch/combine and NCCL dense exchange/combine plus local/remote route counts;
-- `cuda_graph_readiness` with backend, batch size, fail-closed blockers, route/collective metrics, and an optional NCCL graph smoke result.
+- schema-2 `cuda_graph_readiness` with backend, batch size, fail-closed blockers, route/collective metrics, an optional NCCL all-reduce graph smoke, and a `full_decode_graph_probe` object.
 
 Host-staged `dispatch_calls` / `combine_calls` count MoE layer invocations in the fixed greedy run. Host-staged `dispatch_elements` / `combine_elements` count selected routed hidden vectors, so the value is route count times hidden size. NCCL `exchange` and `combine` counters count the dense all-reduce calls and elements used by the current naive NCCL gate.
 
-The GPU event rows are intentionally narrower than the CPU rows. They cover sections that enqueue device work or NCCL work on known streams, including projections, dense/shared/routed experts, NCCL dense exchange, NCCL combine clear, device contribution accumulation, and NCCL combine. They do not relabel host route-plan construction/replay as GPU work, and the mixed `attention_host_path` stays CPU-side because it includes host attention assembly as well as internal GPU projections.
+The GPU event rows are intentionally narrower than the CPU rows. They cover sections that enqueue device work or NCCL work on known streams, including projections, dense/shared/routed experts, NCCL dense exchange, NCCL combine clear, device contribution accumulation, and NCCL combine. They do not relabel host decode work or eager route planning as GPU work, and the mixed `attention_host_path` stays CPU-side because it includes host attention assembly as well as internal GPU projections.
 
 ## Commands
 
@@ -125,6 +125,21 @@ OPENINFER_DSV2_LITE_EP_BACKEND=nccl \
 
 The smoke uses one preallocated f32 NCCL all-reduce over the existing two rank streams. With `--nccl-graph-smoke`, the command exits non-zero unless capture, replay, and verification all pass. Passing proves only basic collective capture/replay in this runtime. It does not prove full decode CUDA Graph coverage.
 
+To request the issue #278 full decode graph probe for the retained single-row NCCL shape, use:
+
+```bash
+OPENINFER_DSV2_LITE_EP_BACKEND=nccl \
+  cargo run --release -p openinfer-deepseek-v2-lite \
+  --features deepseek-v2-lite \
+  --bin dsv2_lite_ep2_decode_attribution \
+  -- --model-path models/DeepSeek-V2-Lite \
+  --batch-size 1 \
+  --full-decode-graph-probe \
+  --out target/accuracy/dsv2-lite-ep2/nccl-full-decode-graph-probe.json
+```
+
+The full probe is fail-closed. `full_decode_capture_ready=true` is valid only when `full_decode_graph_probe` reports capture, instantiate, replay, and verification success. The issue #278 probe path has a fixed-topology MoE path with device router output, fixed-expert device accumulation, device RMSNorm/attention/sampling, graph-safe cuBLAS activation, and paired-rank graph replay. If a future change breaks capture or replay, the report must keep `full_decode_capture_ready=false` and record the exact `failure_stage` / blocker instead of treating partial enqueue evidence as full decode graph coverage.
+
 ## Environment Notes
 
 The NCCL path depends on a runtime that supports the selected GPU. On newer GPUs, older NCCL runtimes may fail communicator initialization before the model-level comparison runs, for example with a shared-memory init error like:
@@ -140,23 +155,27 @@ The HF oracle needs a Python environment that can load DeepSeek-V2-Lite with `tr
 
 ## Latest Validation
 
-The issue #277 route-plan refresh was rerun on 2026-06-14 with DeepSeek-V2-Lite snapshot `604d5664dddd88a0433dbae533b7fe9472482de0`, `prompt="Hello"`, `output_len=16`, and 2x RTX 5090. HF, host-staged, and NCCL were dumped from the same model directory and compared with `--require-all-exact`. The NCCL run used a Python CUDA wheel runtime after the system NCCL runtime failed communicator initialization on this Blackwell host; this is an environment prerequisite, not a model-logic change.
+The issue #278 graph-probe validation was rerun on 2026-06-20 with DeepSeek-V2-Lite snapshot `604d5664dddd88a0433dbae533b7fe9472482de0`, `prompt="Hello"`, `output_len=16`, and 2x RTX 5090. HF, host-staged, and NCCL were dumped from the same model directory and compared with `--require-all-exact`. The NCCL run used a Python CUDA wheel runtime after the system NCCL runtime failed communicator initialization on this Blackwell host; this is an environment prerequisite, not a model-logic change.
 
 - HF / host-staged / NCCL comparison: `all_token_text_exact`.
 - Token SHA256: `4fb4c8825fe4d2c4a1d966da25c259abdf675f4de4548daa5d41aea7dfe30225`.
 - Text SHA256: `0eedf11429e9ac13bb799c31665c6e9f70a1ac4493a08a3f3da9ecf39c1ec347`.
 - Generated text: `, I am a 19 year old girl from the UK. I am`.
-- Candidate NCCL attribution: `gpu_timing.sample_count=8384`, `failure_count=0`.
+- Full-probe NCCL attribution: `gpu_timing.sample_count=8384`, `failure_count=0`.
 
-The candidate readiness report still has `full_decode_capture_ready=false`. Compared with the issue #276 candidate, it removes the old per-token route-iteration and host-directed expert-accumulation blocker IDs. The remaining blockers are `nccl_route_plan_built_on_host` and `nccl_route_plan_replay_host_directed`.
+The schema-2 readiness report now has `full_decode_capture_ready=true` for the retained single-row NCCL graph-probe shape. The probe reports `captured=true`, `instantiated=true`, `replayed=true`, `verified=true`, `failure_stage=none`, `replay_count=8`, `verified_replay_count=8`, and no blocker IDs. The verification compares each captured replay's sampled token against the eager graph-safe reference step, and that reference step first matches the retained eager NCCL oracle for the same prefilled cache.
 
-Current NCCL attribution for the issue #277 gate:
+The issue #278 full probe covers only the retained single-row NCCL decode step (`batch-size=1`, `prompt="Hello"`, `output_len=16`). Batch `4` and `8` attribution rows below are regression evidence for exactness, route counters, and attribution coverage; they do not widen the full decode graph probe claim.
 
-| Batch | GPU event samples | GPU failures | NCCL exchange/combine calls | Route counters | Readiness blockers |
+Current NCCL attribution for the issue #278 gate:
+
+| Batch | Token/text exact | GPU event samples | GPU failures | NCCL exchange/combine calls | Route counters | Full decode graph probe |
 | ---: | ---: | ---: | --- | --- | --- |
-| 1 | 8384 | 0 | `416 / 416` | `local=1284`, `remote=1212`, `combine=2496` | `nccl_route_plan_built_on_host`, `nccl_route_plan_replay_host_directed` |
-| 4 | 23996 | 0 | `494 / 494` | `local=5136`, `remote=4848`, `combine=9984` | `nccl_route_plan_built_on_host`, `nccl_route_plan_replay_host_directed` |
-| 8 | 44812 | 0 | `598 / 598` | `local=10272`, `remote=9696`, `combine=19968` | `nccl_route_plan_built_on_host`, `nccl_route_plan_replay_host_directed` |
+| 1 | yes | 8384 | 0 | `416 / 416` | `local=1284`, `remote=1212`, `combine=2496` | `captured_replayed_verified`, `full_decode_capture_ready=true`, `8/8` verified replays |
+| 4 | yes | 23996 | 0 | `494 / 494` | `local=5136`, `remote=4848`, `combine=9984` | not requested; regression evidence only |
+| 8 | yes | 44812 | 0 | `598 / 598` | `local=10272`, `remote=9696`, `combine=19968` | not requested; regression evidence only |
+
+The optional `--nccl-graph-smoke` path remains a separate collective-only diagnostic. The full decode graph probe above is the retained issue #278 evidence for the covered NCCL decode path; the older A800 smoke pass below is historical evidence for the old all-reduce smoke only.
 
 The previous A800 strict same-host accuracy gate was rerun on 2026-06-04 with DeepSeek-V2-Lite snapshot `604d5664dddd88a0433dbae533b7fe9472482de0`, `prompt="Hello"`, `output_len=16`, and 2x A800-SXM4-80GB. The token/text oracle is confirmed by a real HF `AutoModelForCausalLM.generate(..., do_sample=false, use_cache=true)` run on the same model directory as the Rust E2E gate.
 

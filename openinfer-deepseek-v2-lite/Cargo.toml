@@ -21,6 +21,7 @@ log = { workspace = true }
 memmap2 = { workspace = true }
 nvtx = { workspace = true }
 openinfer-core = { workspace = true }
+openinfer-kernels = { workspace = true, features = ["deepseek-v2-lite"] }
 openinfer-engine = { workspace = true }
 safetensors = { workspace = true }
 serde = { workspace = true }

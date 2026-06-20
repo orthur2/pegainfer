@@ -30,6 +30,7 @@ struct Cli {
     model_path: String,
     batch_size: usize,
     nccl_graph_smoke: bool,
+    full_decode_graph_probe: bool,
     out: Option<PathBuf>,
 }
 
@@ -56,6 +57,7 @@ fn main() -> Result<()> {
         .map_err(|err| anyhow::anyhow!("encode prompt failed: {err:?}"))?;
     ensure!(!prompt_tokens.is_empty(), "tokenizer returned empty prompt");
 
+    trace_stage("load generator");
     let mut generator = DeepSeekV2LiteEp2Generator::load(
         &model_path,
         EngineLoadOptions {
@@ -66,11 +68,22 @@ fn main() -> Result<()> {
             ..EngineLoadOptions::default()
         },
     )?;
+    trace_stage("generator loaded");
     let report = if cli.batch_size == 1 {
+        trace_stage("run batch=1 attribution oracle");
         let (result, attribution) =
             generator.generate_greedy_with_attribution(&prompt_tokens, OUTPUT_LEN, false)?;
-        let graph_readiness =
-            generator.decode_graph_readiness_report(&result.stats, 1, cli.nccl_graph_smoke)?;
+        trace_stage("batch=1 attribution oracle complete");
+        trace_stage("run graph readiness report");
+        let graph_readiness = generator.decode_graph_readiness_report(
+            &result.stats,
+            1,
+            cli.nccl_graph_smoke,
+            cli.full_decode_graph_probe,
+            Some(&prompt_tokens),
+            OUTPUT_LEN,
+        )?;
+        trace_stage("graph readiness report complete");
         single_report(
             &tokenizer,
             &prompt_tokens,
@@ -79,17 +92,24 @@ fn main() -> Result<()> {
             &graph_readiness,
         )?
     } else {
+        trace_stage("run batch attribution oracle");
         let (result, attribution) = generator.generate_greedy_batch_same_prompt_with_attribution(
             &prompt_tokens,
             cli.batch_size,
             OUTPUT_LEN,
             true,
         )?;
+        trace_stage("batch attribution oracle complete");
+        trace_stage("run graph readiness report");
         let graph_readiness = generator.decode_graph_readiness_report(
             &result.stats,
             cli.batch_size,
             cli.nccl_graph_smoke,
+            cli.full_decode_graph_probe,
+            None,
+            OUTPUT_LEN,
         )?;
+        trace_stage("graph readiness report complete");
         batch_report(
             &tokenizer,
             &prompt_tokens,
@@ -111,6 +131,12 @@ fn main() -> Result<()> {
     }
     println!("{text}");
     Ok(())
+}
+
+fn trace_stage(stage: &str) {
+    if env::var_os("OPENINFER_DSV2_LITE_GRAPH_PROBE_TRACE").is_some() {
+        eprintln!("[dsv2-lite-attribution] {stage}");
+    }
 }
 
 fn single_report(
@@ -179,7 +205,7 @@ fn single_report(
             "failure_count": attribution.gpu_timing_failure_count(),
             "nvtx_enabled": attribution.nvtx_enabled(),
             "nvtx_range_count": attribution.nvtx_range_count(),
-            "scope": "selected GPU/NCCL sections only; host route-plan construction/replay and the mixed attention_host_path remain CPU-side attribution rows; GPU timing failures do not replace the token/text hash oracle; NVTX range wall time is only a profiler correlation marker and may include host/event overhead",
+            "scope": "selected GPU/NCCL sections only; host decode work, eager route planning, and the mixed attention_host_path remain CPU-side attribution rows; GPU timing failures do not replace the token/text hash oracle; NVTX range wall time is only a profiler correlation marker and may include host/event overhead",
         },
         "schedule_source": "fixed DeepSeek-V2-Lite EP2 greedy gate: prompt=Hello, output_len=16, cuda_graph=false, device_ordinals=[0,1]",
         "by_section": by_section,
@@ -281,7 +307,7 @@ fn batch_report(
             "failure_count": attribution.gpu_timing_failure_count(),
             "nvtx_enabled": attribution.nvtx_enabled(),
             "nvtx_range_count": attribution.nvtx_range_count(),
-            "scope": "selected GPU/NCCL sections only; host route-plan construction/replay and the mixed attention_host_path remain CPU-side attribution rows; GPU timing failures do not replace the token/text hash oracle; NVTX range wall time is only a profiler correlation marker and may include host/event overhead",
+            "scope": "selected GPU/NCCL sections only; host decode work, eager route planning, and the mixed attention_host_path remain CPU-side attribution rows; GPU timing failures do not replace the token/text hash oracle; NVTX range wall time is only a profiler correlation marker and may include host/event overhead",
         },
         "schedule_source": format!(
             "fixed DeepSeek-V2-Lite EP2 greedy gate: batch_size={}, prompt=Hello, output_len=16, cuda_graph=false, device_ordinals=[0,1]",
@@ -303,6 +329,7 @@ fn parse_cli() -> Result<Option<Cli>> {
     let mut model_path = "models/DeepSeek-V2-Lite".to_string();
     let mut batch_size = 1;
     let mut nccl_graph_smoke = false;
+    let mut full_decode_graph_probe = false;
     let mut out = None;
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -331,21 +358,29 @@ fn parse_cli() -> Result<Option<Cli>> {
             "--nccl-graph-smoke" => {
                 nccl_graph_smoke = true;
             }
+            "--full-decode-graph-probe" => {
+                full_decode_graph_probe = true;
+            }
             "-h" | "--help" => {
                 println!(
-                    "DeepSeek-V2-Lite EP2 decode attribution gate\n\nUSAGE:\n  dsv2_lite_ep2_decode_attribution [--model-path PATH] [--batch-size N] [--nccl-graph-smoke] [--out PATH]\n\nThe gate is intentionally fixed to prompt=Hello, output_len=16, with batch-size in 1..=8. Select NCCL with OPENINFER_DSV2_LITE_EP_BACKEND=nccl. Use --nccl-graph-smoke to run a preallocated f32 NCCL all-reduce CUDA Graph capture/replay smoke after attribution."
+                    "DeepSeek-V2-Lite EP2 decode attribution gate\n\nUSAGE:\n  dsv2_lite_ep2_decode_attribution [--model-path PATH] [--batch-size N] [--nccl-graph-smoke] [--full-decode-graph-probe] [--out PATH]\n\nThe gate is intentionally fixed to prompt=Hello, output_len=16, with batch-size in 1..=8. Select NCCL with OPENINFER_DSV2_LITE_EP_BACKEND=nccl. Use --nccl-graph-smoke to run a preallocated f32 NCCL all-reduce CUDA Graph capture/replay smoke after attribution. Use --full-decode-graph-probe to request the fail-closed full decode graph readiness probe for the retained batch-size=1 NCCL shape."
                 );
                 return Ok(None);
             }
             other => bail!(
-                "unsupported argument `{other}`; supported flags: --model-path PATH, --batch-size N, --nccl-graph-smoke, --out PATH"
+                "unsupported argument `{other}`; supported flags: --model-path PATH, --batch-size N, --nccl-graph-smoke, --full-decode-graph-probe, --out PATH"
             ),
         }
     }
+    ensure!(
+        !full_decode_graph_probe || batch_size == 1,
+        "--full-decode-graph-probe is currently scoped to --batch-size 1, got {batch_size}"
+    );
     Ok(Some(Cli {
         model_path,
         batch_size,
         nccl_graph_smoke,
+        full_decode_graph_probe,
         out,
     }))
 }
@@ -439,8 +474,8 @@ fn coverage_rows(
         }),
         json!({
             "item": "full_decode_cuda_graph_capture",
-            "status": if graph_readiness.full_decode_capture_ready() { "ready" } else { "blocked" },
-            "source": format!("{} blocker(s) reported by the DeepSeek-V2-Lite EP2 graph-readiness diagnostic", graph_readiness.blocker_count()),
+            "status": graph_readiness.full_decode_graph_probe_status(),
+            "source": format!("{} blocker(s) reported by the DeepSeek-V2-Lite EP2 graph-readiness diagnostic; readiness requires full_decode_graph_probe to capture, instantiate, replay, and verify", graph_readiness.blocker_count()),
         }),
         json!({
             "item": "nccl_cuda_graph_smoke",
