@@ -6,7 +6,7 @@ use crossbeam_channel as channel;
 
 use crate::batch_decode_buffers::{BATCH_BUCKETS, BatchDecodeBuffers};
 use crate::config::{Config, TensorParallelConfig};
-use crate::weights::{ModelRuntimeConfig, Qwen3Model};
+use crate::weights::{KvBudget, ModelRuntimeConfig, Qwen3MemoryOptions, Qwen3Model};
 use crate::{Qwen3LoraOptions, Qwen3OffloadOptions};
 use openinfer_core::engine::{LoadLoraAdapterRequest, TokenLogprob, UnloadLoraAdapterRequest};
 use openinfer_core::kv_pool::KvLayout;
@@ -752,8 +752,14 @@ struct PrefetchState {
 }
 
 impl Qwen3Executor {
-    pub(crate) fn single(model: Qwen3Model, offload_opts: &Qwen3OffloadOptions) -> Result<Self> {
-        let budget = model.kv_budget();
+    pub(crate) fn single(
+        model: Qwen3Model,
+        offload_opts: &Qwen3OffloadOptions,
+        max_prefill_tokens: usize,
+        memory_options: Qwen3MemoryOptions,
+    ) -> Result<Self> {
+        let (model, budget) =
+            profile_kv_budget_on_worker(model, max_prefill_tokens, memory_options)?;
         let kv_mgr = KvCacheManager::new(
             &model.device_ctx().stream,
             budget.num_layers,
@@ -805,6 +811,8 @@ impl Qwen3Executor {
             device_ordinals,
             Qwen3LoraOptions::default(),
             Qwen3OffloadOptions::disabled(),
+            crate::scheduler::DEFAULT_MAX_PREFILL_TOKENS,
+            Qwen3MemoryOptions::default(),
         )
     }
 
@@ -814,7 +822,10 @@ impl Qwen3Executor {
         device_ordinals: &[usize],
         lora_options: Qwen3LoraOptions,
         offload_options: Qwen3OffloadOptions,
+        max_prefill_tokens: usize,
+        memory_options: Qwen3MemoryOptions,
     ) -> Result<Self> {
+        let memory_options = memory_options.validate()?;
         let lora_options = lora_options.validate()?;
         anyhow::ensure!(
             !device_ordinals.is_empty(),
@@ -837,7 +848,8 @@ impl Qwen3Executor {
                     max_lora_rank: lora_options.max_lora_rank,
                 },
             )?;
-            let mut executor = Self::single(model, &offload_options)?;
+            let mut executor =
+                Self::single(model, &offload_options, max_prefill_tokens, memory_options)?;
             executor.lora_options = lora_options;
             return Ok(executor);
         }
@@ -857,8 +869,29 @@ impl Qwen3Executor {
             )?);
         }
 
-        // Compute budget from first model (all ranks share geometry).
-        let budget = models[0].kv_budget();
+        // Profile each rank independently and use the minimum shared block
+        // count. The logical scheduler uses one block budget for all ranks, but
+        // free memory and worker-thread runtime allocations are per device.
+        let mut profiled_models = Vec::with_capacity(world_size);
+        let mut budgets = Vec::with_capacity(world_size);
+        for model in models {
+            let (model, budget) =
+                profile_kv_budget_on_worker(model, max_prefill_tokens, memory_options)?;
+            profiled_models.push(model);
+            budgets.push(budget);
+        }
+        let mut models = profiled_models;
+        let mut budget = budgets[0];
+        budget.num_blocks = budgets
+            .iter()
+            .map(|budget| budget.num_blocks)
+            .min()
+            .expect("at least one TP rank");
+        log::info!(
+            "TP KV budget: using {} blocks (minimum across {} ranks)",
+            budget.num_blocks,
+            world_size
+        );
 
         // Create the centralized KvCacheManager on rank 0's stream.
         let kv_mgr = KvCacheManager::new(
@@ -1243,6 +1276,35 @@ impl Qwen3Executor {
         Self::wait_for_step_ack(pending, step.kind())?;
         Ok(primary_result)
     }
+}
+
+fn profile_kv_budget_on_worker(
+    model: Qwen3Model,
+    max_prefill_tokens: usize,
+    memory_options: Qwen3MemoryOptions,
+) -> Result<(Qwen3Model, KvBudget)> {
+    let handle = thread::Builder::new()
+        .name(format!(
+            "qwen3-memory-profile-dev{}",
+            model.device_ctx().device_ordinal
+        ))
+        .spawn(move || -> Result<(Qwen3Model, KvBudget)> {
+            let _guard = {
+                bind_model_thread(&model)?;
+                tune_decode_gemm_algos(&model)?;
+                CublasThreadGuard
+            };
+            let budget = model.profiled_kv_budget(
+                max_prefill_tokens,
+                *BATCH_BUCKETS.last().unwrap(),
+                memory_options,
+            )?;
+            Ok((model, budget))
+        })
+        .map_err(|e| anyhow::anyhow!("failed to spawn Qwen3 memory profile worker: {e}"))?;
+    handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("Qwen3 memory profile worker panicked"))?
 }
 
 /// Build the KV-offload engine for the single-GPU path, or `None` when offload

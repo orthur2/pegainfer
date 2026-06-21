@@ -97,6 +97,16 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = openinfer_qwen3_4b::DEFAULT_MAX_PREFILL_TOKENS)]
     pub max_prefill_tokens: usize,
 
+    /// Fraction of total GPU memory the Qwen3 instance may use. The KV cache is
+    /// sized from this budget after startup profiling accounts for weights,
+    /// runtime buffers, activation peak, CUDA Graph capture, and margin.
+    #[arg(long, default_value_t = openinfer_qwen3_4b::DEFAULT_GPU_MEMORY_UTILIZATION)]
+    pub gpu_memory_utilization: f64,
+
+    /// Additional Qwen3 GPU memory to hold back after profile-based KV sizing,
+    /// in MiB. Covers allocator fragmentation and small unprofiled drift.
+    #[arg(long, default_value_t = (openinfer_qwen3_4b::DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES >> 20) as usize)]
+    pub kv_cache_memory_margin_mib: usize,
     /// How prefill and decode share the GPU (single-GPU Qwen3 only).
     /// `off` serializes them on one stream (lowest TTFT); `stream` overlaps on
     /// two streams sharing all SMs; `green-ctx` pins each to a disjoint Green
