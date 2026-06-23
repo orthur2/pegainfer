@@ -4,12 +4,12 @@ use openinfer_core::tensor::{DeviceContext, HiddenStates};
 
 use crate::{Config, device::activate};
 
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub(crate) struct DecodeCache {
     pub(crate) layers: Vec<LayerCache>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub(crate) struct LayerCache {
     keys: Vec<f32>,
     values: Vec<f32>,
@@ -40,6 +40,27 @@ impl DecodeCache {
                 .map(|_| LayerCache::default())
                 .collect(),
         }
+    }
+
+    pub(crate) fn position(&self, config: &Config) -> Result<usize> {
+        ensure!(
+            self.layers.len() == config.num_hidden_layers,
+            "decode cache layer count mismatch: cache={}, expected={}",
+            self.layers.len(),
+            config.num_hidden_layers
+        );
+        let Some(first) = self.layers.first() else {
+            return Ok(0);
+        };
+        let position = first.len(config);
+        for (layer_idx, layer) in self.layers.iter().enumerate().skip(1) {
+            ensure!(
+                layer.len(config) == position,
+                "decode cache layer {layer_idx} position mismatch: cache_len={}, expected={position}",
+                layer.len(config)
+            );
+        }
+        Ok(position)
     }
 }
 
