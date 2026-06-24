@@ -3850,6 +3850,7 @@ dependencies = [
  "half",
  "kvbm-logical",
  "openinfer-kernels",
+ "tokio",
 ]
 
 [[package]]
@@ -4145,8 +4146,8 @@ dependencies = [
 
 [[package]]
 name = "pegaflow-common"
-version = "0.22.6"
-source = "git+https://github.com/novitalabs/pegaflow.git?rev=07cac7e50e8ae7be15ad1b9311401039c9ee439b#07cac7e50e8ae7be15ad1b9311401039c9ee439b"
+version = "0.22.10"
+source = "git+https://github.com/novitalabs/pegaflow.git?rev=30a8e1ae5f5be7b7d558c451e5369905e048ba7e#30a8e1ae5f5be7b7d558c451e5369905e048ba7e"
 dependencies = [
  "colored",
  "libc",
@@ -4156,8 +4157,8 @@ dependencies = [
 
 [[package]]
 name = "pegaflow-core"
-version = "0.22.6"
-source = "git+https://github.com/novitalabs/pegaflow.git?rev=07cac7e50e8ae7be15ad1b9311401039c9ee439b#07cac7e50e8ae7be15ad1b9311401039c9ee439b"
+version = "0.22.10"
+source = "git+https://github.com/novitalabs/pegaflow.git?rev=30a8e1ae5f5be7b7d558c451e5369905e048ba7e#30a8e1ae5f5be7b7d558c451e5369905e048ba7e"
 dependencies = [
  "ahash",
  "bytesize",
@@ -4185,8 +4186,8 @@ dependencies = [
 
 [[package]]
 name = "pegaflow-proto"
-version = "0.22.6"
-source = "git+https://github.com/novitalabs/pegaflow.git?rev=07cac7e50e8ae7be15ad1b9311401039c9ee439b#07cac7e50e8ae7be15ad1b9311401039c9ee439b"
+version = "0.22.10"
+source = "git+https://github.com/novitalabs/pegaflow.git?rev=30a8e1ae5f5be7b7d558c451e5369905e048ba7e#30a8e1ae5f5be7b7d558c451e5369905e048ba7e"
 dependencies = [
  "prost",
  "tonic",
