@@ -293,6 +293,96 @@ void rms_norm_batched_offset_cuda(const DType *x, const DType *weight, DType *ou
 }
 
 // ============================================================================
+// LayerNorm (with bias) — GLM5.2 DSA indexer k_norm.
+// HAND-WRITTEN: FlashInfer's generalLayerNorm template depends on
+// tensorrt_llm::common::packed_as / num_elems traits that are not available in
+// this build's include path. This kernel is a simple single-token LayerNorm
+// (mean + variance + affine with bias), memory-bound elementwise — same
+// pattern as the hand-written rms_norm_batched_serial_kernel above.
+// eps=1e-6, with bias (unlike RMSNorm which has no bias).
+// Aligned to vllm DeepseekV32Indexer: nn.LayerNorm(head_dim, eps=1e-6).
+// ============================================================================
+__device__ __forceinline__ float warp_reduce_sum(float v) {
+    v += __shfl_down_sync(0xffffffff, v, 16);
+    v += __shfl_down_sync(0xffffffff, v, 8);
+    v += __shfl_down_sync(0xffffffff, v, 4);
+    v += __shfl_down_sync(0xffffffff, v, 2);
+    v += __shfl_down_sync(0xffffffff, v, 1);
+    return v;
+}
+
+__global__ void layer_norm_kernel(const DType *x, const float *gamma, const float *beta,
+                                   DType *out, int n, float eps) {
+    int tid = threadIdx.x;
+    extern __shared__ float smem[];  // [n] for val, reused for partial sums
+
+    // Phase 1: load + mean (warp shuffle reduction).
+    float val = 0.0f;
+    if (tid < n) {
+        val = __bfloat162float(x[tid]);
+    }
+    float sum = warp_reduce_sum(val);
+
+    // Cross-warp reduction via shared memory (only lane 0 of each warp writes).
+    int lane = tid % 32;
+    int warp = tid / 32;
+    int num_warps = blockDim.x / 32;
+    if (lane == 0) {
+        smem[warp] = sum;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        sum = (lane < num_warps) ? smem[lane] : 0.0f;
+        sum = warp_reduce_sum(sum);
+        if (lane == 0) {
+            smem[0] = sum;
+        }
+    }
+    __syncthreads();
+    float mean = smem[0] / n;
+
+    // Phase 2: variance (same reduction pattern).
+    float diff_sum = 0.0f;
+    if (tid < n) {
+        float diff = val - mean;
+        diff_sum = diff * diff;
+    }
+    float var_sum = warp_reduce_sum(diff_sum);
+    if (lane == 0) {
+        smem[warp] = var_sum;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        var_sum = (lane < num_warps) ? smem[lane] : 0.0f;
+        var_sum = warp_reduce_sum(var_sum);
+        if (lane == 0) {
+            smem[0] = var_sum;
+        }
+    }
+    __syncthreads();
+    float rstd = rsqrtf(smem[0] / n + eps);
+
+    // Phase 3: output = (x - mean) * rstd * gamma + beta.
+    if (tid < n) {
+        float normalized = (val - mean) * rstd;
+        out[tid] = __float2bfloat16(normalized * gamma[tid] + beta[tid]);
+    }
+}
+
+CUresult layer_norm_cuda(const DType *x, const float *gamma, const float *beta,
+                         DType *out, int n, float eps, cudaStream_t stream) {
+    if (x == nullptr || gamma == nullptr || beta == nullptr || out == nullptr) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    int block_size = std::min(n, 1024);
+    block_size = 32 * ((block_size + 31) / 32);
+    size_t shmem_size = std::min(block_size / 32, (n + 31) / 32) * sizeof(float);
+    layer_norm_kernel<<<1, block_size, shmem_size, stream>>>(x, gamma, beta, out, n, eps);
+    cudaError_t err = cudaGetLastError();
+    return static_cast<CUresult>(err);
+}
+
+// ============================================================================
 // Fused Add + (1+weight) RMSNorm — Qwen3.5 / Gemma style
 // ============================================================================
 void fused_add_rms_norm_offset_cuda(DType *hidden, const DType *residual,

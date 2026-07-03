@@ -426,16 +426,14 @@ fn deepgemm_paged_mqa_launch() -> Result<()> {
     let q_bytes = (batch_size * next_n * num_heads * head_dim) as usize;
     let q = DeviceBuf::zeroed(q_bytes)?;
 
-    // kv_cache: [num_kv_blocks, block_kv, head_dim] fp8 = 16*128*128 = 262144 bytes
-    let kv_bytes = (num_kv_blocks * block_kv * head_dim) as usize;
+    // kv_cache: interleaved [block_kv * head_dim fp8 | block_kv * 4 f32 scale] per block.
+    // Per-block stride = block_kv * (head_dim + 4) = 64 * 132 = 8448 bytes
+    let kv_stride_bytes = (block_kv as i64) * ((head_dim as i64) + 4);
+    let kv_bytes = (num_kv_blocks * kv_stride_bytes as usize) as usize;
     let kv_cache = DeviceBuf::zeroed(kv_bytes)?;
 
-    // kv_cache_scales: [num_kv_blocks, block_kv] f32 = 16*128*4 = 8192 bytes
-    let kv_scales_bytes = (num_kv_blocks * block_kv) as usize * std::mem::size_of::<f32>();
-    let kv_cache_scales = DeviceBuf::zeroed(kv_scales_bytes)?;
-
-    // weights: [batch_size * next_n, num_heads] fp8 = 1*4 = 4 bytes
-    let weights_bytes = (batch_size * next_n * num_heads) as usize;
+    // weights: [batch_size * next_n, num_heads] f32 = 1*4*4 = 16 bytes
+    let weights_bytes = (batch_size * next_n * num_heads) as usize * std::mem::size_of::<f32>();
     let weights = DeviceBuf::zeroed(weights_bytes)?;
 
     // logits: [batch_size, logits_stride] bf16 = 1*256*2 = 512 bytes
@@ -451,7 +449,7 @@ fn deepgemm_paged_mqa_launch() -> Result<()> {
         ffi::glm52_deepgemm_paged_mqa_logits_cuda(
             q.ptr,
             kv_cache.ptr,
-            kv_cache_scales.ptr as *const f32,
+            kv_stride_bytes,
             weights.ptr,
             context_lens.ptr as *const i32,
             logits.ptr,
@@ -471,7 +469,7 @@ fn deepgemm_paged_mqa_launch() -> Result<()> {
             num_sms,
             1, // q_elem_size (fp8)
             1, // kv_elem_size (fp8)
-            1, // weights_elem_size (fp8)
+            4, // weights_elem_size (f32)
             4, // kv_scales_elem_size (f32)
             STREAM,
         )

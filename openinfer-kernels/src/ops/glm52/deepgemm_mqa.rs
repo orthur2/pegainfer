@@ -10,6 +10,7 @@ pub const GLM52_DEEPGEMM_MQA_SPLIT_KV: usize = 256;
 pub const GLM52_DEEPGEMM_MQA_FP8_ELEM_SIZE: usize = 1;
 pub const GLM52_DEEPGEMM_MQA_BF16_ELEM_SIZE: usize = 2;
 pub const GLM52_DEEPGEMM_MQA_F32_ELEM_SIZE: usize = 4;
+pub const GLM52_DEEPGEMM_MQA_SCALE_BYTES_PER_TOKEN: usize = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Glm52DeepGemmMqaLogitsShape {
@@ -19,6 +20,7 @@ pub struct Glm52DeepGemmMqaLogitsShape {
     pub head_dim: usize,
     pub num_kv_blocks: usize,
     pub block_kv: usize,
+    pub kv_cache_stride_bytes: usize,
     pub is_context_lens_2d: bool,
     pub is_varlen: bool,
     pub logits_stride: usize,
@@ -48,6 +50,13 @@ impl Glm52DeepGemmMqaLogitsShape {
             GLM52_DEEPGEMM_MQA_SPLIT_KV.is_multiple_of(self.block_kv),
             "split_kv must be divisible by block_kv"
         );
+        let min_stride = self.block_kv * (self.head_dim + GLM52_DEEPGEMM_MQA_SCALE_BYTES_PER_TOKEN);
+        ensure!(
+            self.kv_cache_stride_bytes >= min_stride,
+            "kv_cache_stride_bytes must be >= {} (block_kv * (head_dim + 4)), got {}",
+            min_stride,
+            self.kv_cache_stride_bytes
+        );
         ensure!(
             self.logits_stride
                 .is_multiple_of(GLM52_DEEPGEMM_MQA_SPLIT_KV),
@@ -57,13 +66,11 @@ impl Glm52DeepGemmMqaLogitsShape {
         Ok(())
     }
 
+    /// Size required by the SM90 metadata kernel: it writes
+    /// `[q_atom_idx, kv_split_idx]` for each SM (0..num_sms-1)
+    /// plus a sentinel `[end_q_atom_idx, 0]` at index `num_sms`.
     pub fn schedule_metadata_len(self) -> usize {
-        let aligned_bs = self.batch_size.div_ceil(32) * 32;
-        if self.is_varlen {
-            3 * aligned_bs + 1
-        } else {
-            aligned_bs
-        }
+        (self.num_sms + 1) * 2
     }
 }
 
@@ -132,8 +139,7 @@ pub fn glm52_deepgemm_paged_mqa_logits_launch(
     shape: Glm52DeepGemmMqaLogitsShape,
     q: &CudaSlice<u8>,
     kv_cache: &CudaSlice<u8>,
-    kv_cache_scales: &CudaSlice<f32>,
-    weights: &CudaSlice<u8>,
+    weights: &CudaSlice<f32>,
     context_lens: &CudaSlice<i32>,
     logits: &mut CudaSlice<u8>,
     block_table: &CudaSlice<i32>,
@@ -152,21 +158,13 @@ pub fn glm52_deepgemm_paged_mqa_logits_launch(
         "GLM5.2 DeepGEMM MQA q too small: have {}, need {q_need}",
         q.len()
     );
-    let kv_need =
-        shape.num_kv_blocks * shape.block_kv * shape.head_dim * GLM52_DEEPGEMM_MQA_FP8_ELEM_SIZE;
+    let kv_need = shape.num_kv_blocks * shape.kv_cache_stride_bytes;
     ensure!(
         kv_cache.len() >= kv_need,
         "GLM5.2 DeepGEMM MQA kv_cache too small: have {}, need {kv_need}",
         kv_cache.len()
     );
-    ensure!(
-        kv_cache_scales.len() >= shape.num_kv_blocks * shape.block_kv,
-        "GLM5.2 DeepGEMM MQA kv_cache_scales too small: have {}, need {}",
-        kv_cache_scales.len(),
-        shape.num_kv_blocks * shape.block_kv
-    );
-    let w_need =
-        shape.batch_size * shape.next_n * shape.num_heads * GLM52_DEEPGEMM_MQA_FP8_ELEM_SIZE;
+    let w_need = shape.batch_size * shape.next_n * shape.num_heads;
     ensure!(
         weights.len() >= w_need,
         "GLM5.2 DeepGEMM MQA weights too small: have {}, need {w_need}",
@@ -204,7 +202,6 @@ pub fn glm52_deepgemm_paged_mqa_logits_launch(
 
     let (q_ptr, _q_guard) = q.device_ptr(&ctx.stream);
     let (kv_ptr, _kv_guard) = kv_cache.device_ptr(&ctx.stream);
-    let (kvs_ptr, _kvs_guard) = kv_cache_scales.device_ptr(&ctx.stream);
     let (w_ptr, _w_guard) = weights.device_ptr(&ctx.stream);
     let (cl_ptr, _cl_guard) = context_lens.device_ptr(&ctx.stream);
     let (logits_ptr, _logits_guard) = logits.device_ptr_mut(&ctx.stream);
@@ -226,7 +223,7 @@ pub fn glm52_deepgemm_paged_mqa_logits_launch(
         ffi::glm52_deepgemm_paged_mqa_logits_cuda(
             q_ptr as *const std::ffi::c_void,
             kv_ptr as *const std::ffi::c_void,
-            kvs_ptr as *const f32,
+            shape.kv_cache_stride_bytes as i64,
             w_ptr as *const std::ffi::c_void,
             cl_ptr as *const i32,
             logits_ptr as *mut std::ffi::c_void,
@@ -246,7 +243,7 @@ pub fn glm52_deepgemm_paged_mqa_logits_launch(
             shape.num_sms as i32,
             GLM52_DEEPGEMM_MQA_FP8_ELEM_SIZE as i32,
             GLM52_DEEPGEMM_MQA_FP8_ELEM_SIZE as i32,
-            GLM52_DEEPGEMM_MQA_FP8_ELEM_SIZE as i32,
+            GLM52_DEEPGEMM_MQA_F32_ELEM_SIZE as i32,
             GLM52_DEEPGEMM_MQA_F32_ELEM_SIZE as i32,
             ctx.stream.cu_stream(),
         )
